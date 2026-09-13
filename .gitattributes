@@ -1,0 +1,9 @@
+# 把 vendored 静态库标成二进制，避免 diff / 行尾转换 / 合并把它当文本处理
+Vendor/zstd/lib/libzstd.a binary
+*.a binary
+*.icns binary
+*.png binary
+*.jpg binary
+
+# 生成的 Xcode 工程不做语言统计
+NativeHarness.xcodeproj/** linguist-generated=true

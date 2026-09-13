@@ -1,0 +1,2281 @@
+{
+  "agent/inbox/spliced": {
+    "count": 103,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "inserted": {
+          "item": {
+            "members": {
+              "content": {
+                "item": {
+                  "members": {
+                    "attachment": {
+                      "kinds": [
+                        "object"
+                      ],
+                      "members": {
+                        "attachmentId": {
+                          "kinds": [
+                            "string"
+                          ]
+                        },
+                        "bytes": {
+                          "kinds": [
+                            "number"
+                          ]
+                        },
+                        "height": {
+                          "kinds": [
+                            "number"
+                          ]
+                        },
+                        "mediaType": {
+                          "kinds": [
+                            "string"
+                          ]
+                        },
+                        "name": {
+                          "kinds": [
+                            "string"
+                          ]
+                        },
+                        "originalDimensions": {
+                          "kinds": [
+                            "object"
+                          ],
+                          "members": {
+                            "height": {
+                              "kinds": [
+                                "number"
+                              ]
+                            },
+                            "width": {
+                              "kinds": [
+                                "number"
+                              ]
+                            }
+                          }
+                        },
+                        "width": {
+                          "kinds": [
+                            "number"
+                          ]
+                        }
+                      }
+                    },
+                    "text": {
+                      "kinds": [
+                        "string"
+                      ]
+                    },
+                    "type": {
+                      "kinds": [
+                        "string"
+                      ]
+                    }
+                  }
+                },
+                "itemKinds": [
+                  "object"
+                ],
+                "kinds": [
+                  "array"
+                ]
+              },
+              "id": {
+                "kinds": [
+                  "string"
+                ]
+              },
+              "role": {
+                "kinds": [
+                  "string"
+                ]
+              },
+              "source": {
+                "kinds": [
+                  "object"
+                ],
+                "members": {
+                  "clientTimeZone": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "form": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "kind": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "plugin": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "rpcId": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "summary": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "itemKinds": [
+            "object"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "removedCount": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "start": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "target": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "approval/asked": {
+    "count": 10,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "callId": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "id": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "reason": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "toolName": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "approval/decided": {
+    "count": 10,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "id": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "outcome": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "approval/policy": {
+    "count": 1,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "policy": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "assistant/chunk": {
+    "count": 4225,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "chunk": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "argumentsDelta": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "block": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "arguments": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "id": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "name": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "text": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "type": {
+                  "kinds": [
+                    "string"
+                  ]
+                }
+              }
+            },
+            "blockType": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "id": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "index": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "name": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "reason": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "kind": {
+                  "kinds": [
+                    "string"
+                  ]
+                }
+              }
+            },
+            "text": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "type": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "usage": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "cacheReadTokens": {
+                  "kinds": [
+                    "number"
+                  ]
+                },
+                "inputTokens": {
+                  "kinds": [
+                    "number"
+                  ]
+                },
+                "outputTokens": {
+                  "kinds": [
+                    "number"
+                  ]
+                },
+                "reasoningTokens": {
+                  "kinds": [
+                    "number"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "assistant/message": {
+    "count": 358,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "sourceEventSeqs": {
+          "kinds": [
+            "array"
+          ]
+        },
+        "surfaceOp": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "interrupted": {
+          "kinds": [
+            "boolean"
+          ]
+        },
+        "message": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "content": {
+              "item": {
+                "members": {
+                  "arguments": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "id": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "name": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "text": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "type": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "id": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "role": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "source": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "kind": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "model": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "provider": {
+                  "kinds": [
+                    "string"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "usage": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "cacheReadTokens": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "inputTokens": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "outputTokens": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "reasoningTokens": {
+              "kinds": [
+                "number"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "command/done": {
+    "count": 4,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "commandId": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "kind": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "text": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "command/run": {
+    "count": 4,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "args": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "commandId": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "name": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "source": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "kind": {
+              "kinds": [
+                "string"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "permission/preset": {
+    "count": 1,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "preset": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "plan/mode": {
+    "count": 8,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "active": {
+          "kinds": [
+            "boolean"
+          ]
+        }
+      }
+    }
+  },
+  "reasoning-chunks": {
+    "count": 12953,
+    "envelope": {
+      "members": {
+        "seq0": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time0": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "dt": {
+          "itemKinds": [
+            "number"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "index": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "texts": {
+          "itemKinds": [
+            "string"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "request/context": {
+    "count": 2,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "contextWindow": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "model": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "provider": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "request/header": {
+    "count": 11,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "header": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "adapterDefaults": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "maxTokens": {
+                  "kinds": [
+                    "boolean"
+                  ]
+                }
+              }
+            },
+            "config": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "maxTokens": {
+                  "kinds": [
+                    "number"
+                  ]
+                },
+                "model": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "provider": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "reasoningEffort": {
+                  "kinds": [
+                    "string"
+                  ]
+                }
+              }
+            },
+            "system": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "tools": {
+              "item": {
+                "members": {
+                  "description": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "name": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "parameters": {
+                    "kinds": [
+                      "object"
+                    ],
+                    "members": {
+                      "properties": {
+                        "kinds": [
+                          "object"
+                        ],
+                        "members": {
+                          "questions": {
+                            "kinds": [
+                              "object"
+                            ],
+                            "members": {
+                              "description": {
+                                "kinds": [
+                                  "string"
+                                ]
+                              },
+                              "items": {
+                                "kinds": [
+                                  "object"
+                                ]
+                              },
+                              "type": {
+                                "kinds": [
+                                  "string"
+                                ]
+                              }
+                            }
+                          }
+                        }
+                      },
+                      "required": {
+                        "itemKinds": [
+                          "string"
+                        ],
+                        "kinds": [
+                          "array"
+                        ]
+                      },
+                      "type": {
+                        "kinds": [
+                          "string"
+                        ]
+                      }
+                    }
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            }
+          }
+        },
+        "reason": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "sandbox/mode": {
+    "count": 1,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "mode": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "session": {
+    "count": 1,
+    "envelope": {
+      "members": {
+        "agentPreset": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "createdAt": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "cwd": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "delegationDepth": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "id": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "version": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "session/end-seed": {
+    "count": 2,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {}
+    }
+  },
+  "session/title": {
+    "count": 2,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "messageSeqs": {
+          "itemKinds": [
+            "number"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "source": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "kind": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "model": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "model": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "provider": {
+                  "kinds": [
+                    "string"
+                  ]
+                }
+              }
+            },
+            "provider": {
+              "kinds": [
+                "string"
+              ]
+            }
+          }
+        },
+        "title": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "session/title-llm-request": {
+    "count": 1,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "maxTokens": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "messageSeqs": {
+          "itemKinds": [
+            "number"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "messages": {
+          "item": {
+            "members": {
+              "content": {
+                "item": {
+                  "members": {
+                    "text": {
+                      "kinds": [
+                        "string"
+                      ]
+                    },
+                    "type": {
+                      "kinds": [
+                        "string"
+                      ]
+                    }
+                  }
+                },
+                "itemKinds": [
+                  "object"
+                ],
+                "kinds": [
+                  "array"
+                ]
+              },
+              "id": {
+                "kinds": [
+                  "string"
+                ]
+              },
+              "role": {
+                "kinds": [
+                  "string"
+                ]
+              },
+              "source": {
+                "kinds": [
+                  "object"
+                ],
+                "members": {
+                  "kind": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "plugin": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "itemKinds": [
+            "object"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "route": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "model": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "provider": {
+              "kinds": [
+                "string"
+              ]
+            }
+          }
+        },
+        "system": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "titleProvider": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  },
+  "step/end": {
+    "count": 360,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "step/start": {
+    "count": 360,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "text-chunks": {
+    "count": 1268,
+    "envelope": {
+      "members": {
+        "seq0": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time0": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "dt": {
+          "itemKinds": [
+            "number"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "index": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "texts": {
+          "itemKinds": [
+            "string"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "todo/write": {
+    "count": 4,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "todos": {
+          "item": {
+            "members": {
+              "content": {
+                "kinds": [
+                  "string"
+                ]
+              },
+              "status": {
+                "kinds": [
+                  "string"
+                ]
+              }
+            }
+          },
+          "itemKinds": [
+            "object"
+          ],
+          "kinds": [
+            "array"
+          ]
+        }
+      }
+    }
+  },
+  "tool-call-chunks": {
+    "count": 3111,
+    "envelope": {
+      "members": {
+        "seq0": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time0": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "args": {
+          "itemKinds": [
+            "string"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "dt": {
+          "itemKinds": [
+            "number"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "id": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "index": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "name": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "tool/call": {
+    "count": 334,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "arguments": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "callId": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "name": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "tool/result": {
+    "count": 334,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "sourceEventSeqs": {
+          "kinds": [
+            "array"
+          ]
+        },
+        "surfaceOp": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "error": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "code": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "name": {
+              "kinds": [
+                "string"
+              ]
+            }
+          }
+        },
+        "message": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "content": {
+              "item": {
+                "members": {
+                  "content": {
+                    "item": {
+                      "members": {
+                        "text": {
+                          "kinds": [
+                            "string"
+                          ]
+                        },
+                        "type": {
+                          "kinds": [
+                            "string"
+                          ]
+                        }
+                      }
+                    },
+                    "itemKinds": [
+                      "object"
+                    ],
+                    "kinds": [
+                      "array"
+                    ]
+                  },
+                  "isError": {
+                    "kinds": [
+                      "boolean"
+                    ]
+                  },
+                  "toolCallId": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "type": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "id": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "role": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "source": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "callId": {
+                  "kinds": [
+                    "string"
+                  ]
+                },
+                "kind": {
+                  "kinds": [
+                    "string"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "meta": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "diffs": {
+              "item": {
+                "members": {
+                  "newText": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "oldText": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "path": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "files": {
+              "item": {
+                "members": {
+                  "matches": {
+                    "item": {
+                      "members": {
+                        "line": {
+                          "kinds": [
+                            "string"
+                          ]
+                        },
+                        "lineNumber": {
+                          "kinds": [
+                            "number"
+                          ]
+                        }
+                      }
+                    },
+                    "itemKinds": [
+                      "object"
+                    ],
+                    "kinds": [
+                      "array"
+                    ]
+                  },
+                  "path": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "lang": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "lines": {
+              "item": {
+                "members": {
+                  "number": {
+                    "kinds": [
+                      "number"
+                    ]
+                  },
+                  "text": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "offset": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "path": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "paths": {
+              "itemKinds": [
+                "string"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "shape": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "sources": {
+              "item": {
+                "members": {
+                  "title": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "url": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "total": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "totalLines": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "truncated": {
+              "kinds": [
+                "boolean"
+              ]
+            }
+          }
+        },
+        "step": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "turn/end": {
+    "count": 50,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "reason": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "kind": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "reason": {
+              "kinds": [
+                "object"
+              ],
+              "members": {
+                "kind": {
+                  "kinds": [
+                    "string"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "turn/start": {
+    "count": 50,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "turn": {
+          "kinds": [
+            "number"
+          ]
+        }
+      }
+    }
+  },
+  "user/message": {
+    "count": 54,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "surfaceOp": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "content": {
+          "item": {
+            "members": {
+              "attachment": {
+                "kinds": [
+                  "object"
+                ],
+                "members": {
+                  "attachmentId": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "bytes": {
+                    "kinds": [
+                      "number"
+                    ]
+                  },
+                  "height": {
+                    "kinds": [
+                      "number"
+                    ]
+                  },
+                  "mediaType": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "name": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "originalDimensions": {
+                    "kinds": [
+                      "object"
+                    ],
+                    "members": {
+                      "height": {
+                        "kinds": [
+                          "number"
+                        ]
+                      },
+                      "width": {
+                        "kinds": [
+                          "number"
+                        ]
+                      }
+                    }
+                  },
+                  "width": {
+                    "kinds": [
+                      "number"
+                    ]
+                  }
+                }
+              },
+              "text": {
+                "kinds": [
+                  "string"
+                ]
+              },
+              "type": {
+                "kinds": [
+                  "string"
+                ]
+              }
+            }
+          },
+          "itemKinds": [
+            "object"
+          ],
+          "kinds": [
+            "array"
+          ]
+        },
+        "id": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "role": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "source": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "clientTimeZone": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "form": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "kind": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "plugin": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "rpcId": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "sections": {
+              "item": {
+                "members": {
+                  "name": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "text": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "summary": {
+              "kinds": [
+                "string"
+              ]
+            }
+          }
+        }
+      }
+    }
+  },
+  "web/deepseek-search-llm-request": {
+    "count": 9,
+    "envelope": {
+      "members": {
+        "seq": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "time": {
+          "kinds": [
+            "number"
+          ]
+        },
+        "type": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    },
+    "data": {
+      "members": {
+        "apiVersion": {
+          "kinds": [
+            "string"
+          ]
+        },
+        "body": {
+          "kinds": [
+            "object"
+          ],
+          "members": {
+            "max_tokens": {
+              "kinds": [
+                "number"
+              ]
+            },
+            "messages": {
+              "item": {
+                "members": {
+                  "content": {
+                    "item": {
+                      "members": {
+                        "text": {
+                          "kinds": [
+                            "string"
+                          ]
+                        },
+                        "type": {
+                          "kinds": [
+                            "string"
+                          ]
+                        }
+                      }
+                    },
+                    "itemKinds": [
+                      "object"
+                    ],
+                    "kinds": [
+                      "array"
+                    ]
+                  },
+                  "role": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            },
+            "model": {
+              "kinds": [
+                "string"
+              ]
+            },
+            "tools": {
+              "item": {
+                "members": {
+                  "max_uses": {
+                    "kinds": [
+                      "number"
+                    ]
+                  },
+                  "name": {
+                    "kinds": [
+                      "string"
+                    ]
+                  },
+                  "type": {
+                    "kinds": [
+                      "string"
+                    ]
+                  }
+                }
+              },
+              "itemKinds": [
+                "object"
+              ],
+              "kinds": [
+                "array"
+              ]
+            }
+          }
+        },
+        "endpoint": {
+          "kinds": [
+            "string"
+          ]
+        }
+      }
+    }
+  }
+}

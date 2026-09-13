@@ -1,0 +1,36 @@
+# ── macOS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ── Swift / SwiftPM ───────────────────────────────────────────────────────────
+.build/
+.swiftpm/
+Package.resolved
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# ── 生成产物：Xcode 工程由 Tools/gen-xcodeproj.mjs 生成 ───────────────────────
+# 不要手改 .pbxproj，改生成器；此目录可随时重建。
+NativeHarness.xcodeproj/
+
+# ── 构建产物 ──────────────────────────────────────────────────────────────────
+build/
+DerivedData/
+*.app
+*.dSYM/
+*.ipa
+
+# ── 临时 / 探针 ───────────────────────────────────────────────────────────────
+.scratch/
+*.log
+
+# ── 本地配置与凭据（绝不要提交）───────────────────────────────────────────────
+.env
+.env.*
+*.local
+*.pem
+*.p12
+*.cer
+*.mobileprovision
