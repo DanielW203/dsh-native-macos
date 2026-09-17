@@ -1,5 +1,7 @@
 # NativeHarness (DSH Native)
 
+[English](README.en.md) · **简体中文**
+
 **macOS 原生 DSH 客户端：任意版本可装、升级自带体检、坏了自动退回；手机远控只要一个开关。**
 
 *A native SwiftUI macOS shell for DeepSeek Harness — every version installable, upgrades self-checked, one-click rollback.*
