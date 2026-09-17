@@ -22,6 +22,18 @@ public enum RuntimeError: Error, LocalizedError, Sendable, Equatable {
   case noActiveRelease
   case releaseNotFound(String)
   case releaseInUse(String)
+  /// A removal was refused because an in-flight upgrade needs this release to fall back to.
+  ///
+  /// Distinct from `releaseInUse` because the remedy is different: the fix is not "stop the
+  /// harness", it is "let the upgrade finish". Telling the user the wrong remedy is worse than
+  /// the refusal itself.
+  case releaseIsRollbackTarget(String)
+  /// An upgrade was asked for with nothing to fall back to.
+  ///
+  /// Its own case rather than a reuse of `releaseInUse` because it is a precondition the user
+  /// can act on *before* anything changes — "keep a second version installed" — and the
+  /// upgrade must refuse before it moves the active pointer, not after.
+  case noRollbackTarget(String)
   case operationInProgress(String)
   case insufficientSpace(requiredBytes: Int64, availableBytes: Int64)
   case unsupported(String)
@@ -58,6 +70,11 @@ public enum RuntimeError: Error, LocalizedError, Sendable, Equatable {
       return "No installed harness release with id \(id)"
     case .releaseInUse(let id):
       return "Release \(id) is in use; stop the running harness first"
+    case .releaseIsRollbackTarget(let id):
+      return "Release \(id) is the rollback target of an upgrade in progress; "
+        + "finish or resolve that upgrade before removing it"
+    case .noRollbackTarget(let detail):
+      return "No release to roll back to: \(detail)"
     case .operationInProgress(let detail):
       return "Another runtime operation is in progress: \(detail)"
     case .insufficientSpace(let requiredBytes, let availableBytes):
@@ -82,6 +99,8 @@ public enum RuntimeError: Error, LocalizedError, Sendable, Equatable {
     case .noActiveRelease: return "NO_ACTIVE_RELEASE"
     case .releaseNotFound: return "RELEASE_NOT_FOUND"
     case .releaseInUse: return "RELEASE_IN_USE"
+    case .releaseIsRollbackTarget: return "RELEASE_IS_ROLLBACK_TARGET"
+    case .noRollbackTarget: return "NO_ROLLBACK_TARGET"
     case .operationInProgress: return "OPERATION_IN_PROGRESS"
     case .insufficientSpace: return "INSUFFICIENT_SPACE"
     case .unsupported: return "UNSUPPORTED"

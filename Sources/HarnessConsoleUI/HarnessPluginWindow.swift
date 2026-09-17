@@ -324,7 +324,7 @@ struct PluginsPane: View {
     HStack(spacing: 12) {
       // Says where the rest of the plugin lifecycle lives. This window installs, imports,
       // removes, and rolls back the last install; browsing and updating are DSH Market's job.
-      Text("Install, remove, and roll back here; browse and update in DSH Market (Harness ▸ DSH Market).")
+      Text("Install, remove, and roll back here; browse and update in DSH Market.")
         .font(.caption)
         .foregroundStyle(.secondary)
       Spacer()

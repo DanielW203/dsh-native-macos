@@ -161,6 +161,10 @@ public struct ILinkError: Error, Equatable, Sendable {
     case invalidLoginStatus
     case untrustedEndpoint
     case providerRejected
+    /// The provider says the session is over (`-14`): a new QR scan is the only way back.
+    case sessionExpired
+    /// The provider refused the request itself (`-2`): the call was wrong, the binding is fine.
+    case invalidRequest
     case notConfigured
     case mediaTooLarge
     case decryptionFailed
@@ -185,17 +189,62 @@ extension ILinkError: LocalizedError {
 ///
 /// iLink answers HTTP 200 for application-level failures and puts the verdict in
 /// `ret`, so a client that only checks the status code would treat "not logged in"
-/// as a successful long poll forever.
+/// as a successful long poll forever. An expired session is reported separately as
+/// `errcode: -14` (that is the code the provider's own SDKs re-login on), so both
+/// spellings are read rather than assuming one and spinning on the other.
 public enum ILinkResponse {
   public static func rejectionCode(_ value: JSONValue) -> String? {
-    guard let ret = value["ret"] else { return nil }
-    if let number = ret.doubleValue {
+    if let code = code(value["ret"]) { return code }
+    return code(value["errcode"])
+  }
+
+  /// The provider's own sentence about a rejection, when it sent one.
+  ///
+  /// `ret` alone cannot tell "you sent a field I do not accept" from "your session is over";
+  /// the body is the only place that can, and dropping it makes a diagnosable failure look like
+  /// an unexplained "拒绝".
+  public static func errorDetail(_ value: JSONValue) -> String {
+    for key in ["errmsg", "err_msg", "msg", "message"] {
+      if let text = value[key]?.stringValue,
+         !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return "：\(text)"
+      }
+    }
+    return ""
+  }
+
+  private static func code(_ raw: JSONValue?) -> String? {
+    guard let raw else { return nil }
+    if let number = raw.doubleValue {
       return number == 0 ? nil : String(Int(number))
     }
-    if let text = ret.stringValue {
+    if let text = raw.stringValue {
       let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
       return trimmed.isEmpty || trimmed == "0" ? nil : trimmed
     }
     return nil
+  }
+}
+
+/// What a rejected provider response means for the channel.
+///
+/// The distinction is not cosmetic: a session that expired needs a new QR scan, while a request
+/// the provider refused over its parameters means the *call* was wrong. Collapsing both into
+/// "provider rejected" is what turned a bad parameter into "微信需要重新绑定" and stopped the
+/// long poll for good.
+public enum ILinkRejection: Equatable, Sendable {
+  /// `-14`: the session is over; only a new login can help.
+  case sessionExpired
+  /// `-2`: the request body was not accepted.
+  case invalidRequest
+  /// Anything else, carried verbatim so an unknown code is never guessed at.
+  case other(String)
+
+  public init(rawCode: String) {
+    switch rawCode {
+    case "-14": self = .sessionExpired
+    case "-2": self = .invalidRequest
+    default: self = .other(rawCode)
+    }
   }
 }

@@ -208,6 +208,13 @@ public struct HarnessWebWindow: View {
           .frame(maxWidth: 640, maxHeight: 160)
         }
 
+        // Why there is no harness can be answered by a version change: an upgrade that failed
+        // and rolled back leaves the runtime on the *other* release, and a plain boot failure
+        // would hide that the app moved anything at all.
+        if let report = model.upgradeReport, report.isWorthShowingAtLaunch {
+          upgradeBanner(report)
+        }
+
         VStack(alignment: .leading, spacing: 4) {
           Text("Once it is running, the harness asks for two things:")
             .font(.caption)
@@ -299,6 +306,32 @@ public struct HarnessWebWindow: View {
     }
     .frame(maxWidth: .infinity, maxHeight: .infinity)
     .padding(24)
+  }
+
+  /// What the last version change did, when it is still something the user needs to know.
+  ///
+  /// Shown on the panel that explains why there is no harness, because that is the question it
+  /// answers: the runtime is on the *other* release now, and the console's report is behind a
+  /// window the user may not have open.
+  @ViewBuilder
+  private func upgradeBanner(_ report: UpgradeReport) -> some View {
+    VStack(alignment: .leading, spacing: 4) {
+      Text("上次更新：\(report.outcome.displayName)")
+        .font(.callout.weight(.semibold))
+      Text(report.summary)
+        .font(.caption)
+        .foregroundStyle(.secondary)
+      if let failure = report.bootFailure {
+        Text(failure)
+          .font(.caption2.monospaced())
+          .foregroundStyle(.orange)
+          .lineLimit(6)
+          .textSelection(.enabled)
+      }
+    }
+    .frame(maxWidth: 640, alignment: .leading)
+    .padding(10)
+    .background(.quaternary, in: RoundedRectangle(cornerRadius: 8))
   }
 
   /// What the boot is saying right now, with nothing to scroll.

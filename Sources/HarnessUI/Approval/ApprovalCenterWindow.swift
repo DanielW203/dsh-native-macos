@@ -23,6 +23,16 @@ public enum TurnWatchState: Sendable, Equatable {
   }
 }
 
+/// What the phone needs when a turn ends.
+///
+/// A seam rather than a reference to the channel: this model's job is "which endings are news", and
+/// a caller that also owned the transport would have to be handed a bot credential just to test that
+/// judgement. `nil` means there is no phone in this build, and forwarding is simply not attempted.
+public protocol PhoneInfoForwarding: Sendable {
+  /// Push one ended turn — a headline, and the answer it produced when there is one.
+  func forwardTurn(_ completion: TurnCompletion) async
+}
+
 /// The approval model: one live subscription to the harness's forwarded-event stream, and
 /// the decisions that come back out of it.
 ///
@@ -86,6 +96,14 @@ public final class ApprovalAlertModel: ObservableObject {
 
   /// Called when the user asks to see an approval in the app (notification body click).
   public var onOpenAlert: ((String) -> Void)?
+
+  /// Where a finished turn is forwarded, when the phone is on the hook.
+  ///
+  /// Set by the app once both models exist rather than taken in the initializer: the channel and
+  /// this model are built in the same `init`, and threading one through the other's constructor
+  /// would make the order they are created matter. `nil` — tests, a build with no channel — turns the
+  /// forwarding path off without a second flag to keep in step.
+  public var phoneForwarder: (any PhoneInfoForwarding)?
 
   public static let notificationsDefaultsKey = "NativeHarness.approval.notifications"
   public static let floatingPanelDefaultsKey = "NativeHarness.approval.floatingPanel"
@@ -158,6 +176,9 @@ public final class ApprovalAlertModel: ObservableObject {
 
   deinit {
     retryTask?.cancel()
+    // The connection pool behind `transport` is released by the transport itself: a concrete
+    // transport tears its session down when it is deallocated, and touching an actor-isolated
+    // stored property from a nonisolated `deinit` is not a safe way to reach it.
   }
 
   // MARK: Derived state
@@ -239,11 +260,16 @@ public final class ApprovalAlertModel: ObservableObject {
             TurnCompletionWatcher.WatchTarget(
               sessionID: summary.id.description,
               title: summary.title,
-              // A child session is one the harness recorded with a parent. `delegationDepth` is the
-              // other available signal, and either is enough to keep a subagent out of the default
-              // notification set.
-              isSubagent: summary.parentID != nil || (summary.delegationDepth ?? 0) > 0,
-              updatedAt: summary.updatedAt
+              // Read from the session list's own two signals (`parentSessionId`, `origin`) plus the
+              // lineage depth when the caller has it. This is what keeps a fan-out's sessions out of
+              // the default notification set — and, because the watcher follows only the most recent
+              // few sessions, out of the slots the user's own sessions need.
+              isSubagent: summary.isSubagent
+                || summary.parentID != nil
+                || (summary.delegationDepth ?? 0) > 0,
+              updatedAt: summary.updatedAt,
+              // Carried so a forwarder can find the session's log without re-reading the list.
+              cwd: summary.cwd
             )
           }
           self.watchTargets = targets
@@ -276,6 +302,15 @@ public final class ApprovalAlertModel: ObservableObject {
   /// leaving a second path alive. `deservesNotification` has already removed the endings that are
   /// not news (the user's own stop, a recovery artifact).
   func deliver(_ completion: TurnCompletion) async {
+    // Forwarded to the phone first, and before the local gates below on purpose: those switches
+    // answer "do I want popups on this Mac", while forwarding is the phone's own outlet and is
+    // gated by the phone's own switch. A user who silenced macOS notifications but left 手机远控 on
+    // is asking for exactly this. The subagent preference is the one exception — it exists to stop
+    // noise from a fan-out, and that noise is worse on a phone than in a notification centre.
+    if !(completion.isSubagent && !subagentNotificationsEnabled) {
+      await phoneForwarder?.forwardTurn(completion)
+    }
+
     guard notificationsEnabled else { return }
     if completion.isSubagent && !subagentNotificationsEnabled { return }
     if completion.kind.isFailure {
@@ -347,8 +382,12 @@ public final class ApprovalAlertModel: ObservableObject {
   /// bounded backoff — the same shape the chat channel uses, so a flapping harness cannot
   /// turn into a busy loop.
   private func streamEnded() async {
-    guard center != nil else { return }
-    center = nil
+    guard let center else { return }
+    self.center = nil
+    // Close the carrier that just ended. Its socket is dead but still holds a descriptor, and
+    // this path runs once per dropped connection — leaving it to deallocation is how a flapping
+    // harness turns into thousands of open sockets.
+    await center.stop()
     if urlProvider() == nil {
       await teardown(clearAlerts: true)
       connection = .idle

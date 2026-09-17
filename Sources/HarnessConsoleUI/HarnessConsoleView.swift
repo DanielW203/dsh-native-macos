@@ -140,6 +140,7 @@ private struct RuntimePane: View {
         activeCard
         actionsCard
         candidatesCard
+        upgradeCard
         releasesCard
       }
       .padding(14)
@@ -411,10 +412,18 @@ private struct RuntimePane: View {
                 Text(note).font(.caption2).foregroundStyle(.secondary)
               }
               Spacer()
+              if model.canUpdate {
+                Button("下载并更新") {
+                  Task { await model.downloadAndUpdate(candidate) }
+                }
+                .disabled(model.isBusy || model.upgradeRunning)
+                .help("下载后自动激活、重启并自检；起不来就自动回到当前版本")
+              }
               Button("Install") {
                 Task { await model.install(source: candidate.source) }
               }
               .disabled(model.isBusy)
+              .help("只安装并激活，不重启、不检查")
             }
           }
           ForEach(model.channelNotes, id: \.self) { note in
@@ -424,6 +433,129 @@ private struct RuntimePane: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(6)
       }
+    }
+  }
+
+  /// What the last version change did, and what the app checked afterwards.
+  ///
+  /// Drawn whenever there is anything to say — including a report written by a *previous*
+  /// launch. An upgrade that failed while the app was restarting is precisely the one the
+  /// user comes back to this window to understand, so the card must not depend on this
+  /// process having been the one that ran it.
+  @ViewBuilder
+  private var upgradeCard: some View {
+    if model.upgradeRunning || model.upgradeReport != nil || model.pendingRollbackTarget != nil {
+      GroupBox("版本更新") {
+        VStack(alignment: .leading, spacing: 8) {
+          if model.upgradeRunning {
+            HStack(spacing: 6) {
+              ProgressView().controlSize(.small)
+              Text("正在更新：激活 → 重启 → 自检…").font(.callout)
+            }
+          }
+
+          if let pending = model.pendingRollbackTarget, !model.upgradeRunning {
+            Text("有一次更新没有走完；它的回退目标是 \(pending)。下次启动会继续处理。")
+              .font(.caption)
+              .foregroundStyle(.orange)
+          }
+
+          if let report = model.upgradeReport {
+            reportHeader(report)
+            Text(report.summary).font(.callout)
+
+            if let failure = report.bootFailure {
+              // The harness's own output, verbatim and selectable: it is the only thing that
+              // explains why, and paraphrasing a stack trace loses the stack trace.
+              Text(failure)
+                .font(.caption2.monospaced())
+                .foregroundStyle(.orange)
+                .lineLimit(12)
+                .textSelection(.enabled)
+            }
+
+            if !report.checks.isEmpty {
+              Divider()
+              ForEach(report.checks) { check in
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                  Image(systemName: Self.checkSymbol(check.verdict))
+                    .font(.caption2)
+                    .foregroundStyle(Self.checkTint(check.verdict))
+                  Text(check.name).font(.caption.monospaced())
+                  Text(check.verdict.displayName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                  Text(check.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                  Spacer(minLength: 0)
+                }
+              }
+            }
+
+            ForEach(report.notes, id: \.self) { note in
+              Text(note).font(.caption2).foregroundStyle(.orange)
+            }
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(6)
+      }
+    }
+  }
+
+  /// The outcome line, plus the one action a completed upgrade still leaves open.
+  @ViewBuilder
+  private func reportHeader(_ report: UpgradeReport) -> some View {
+    HStack(spacing: 8) {
+      Text(report.outcome.displayName)
+        .font(.caption).bold()
+        .padding(.horizontal, 6).padding(.vertical, 2)
+        .background(
+          Self.outcomeTint(report.outcome).opacity(0.18),
+          in: Capsule()
+        )
+        .foregroundStyle(Self.outcomeTint(report.outcome))
+      Text("→ \(report.toReleaseID)").font(.callout)
+      if let back = report.rolledBackTo {
+        Text("（已回到 \(back)）").font(.caption).foregroundStyle(.secondary)
+      }
+      Spacer(minLength: 0)
+      // Offered even after a `kept` outcome: a check can have warned without failing, and the
+      // user is the one who decides whether a warning is worth undoing the upgrade over.
+      if let from = report.fromReleaseID, from != model.activeReleaseID, model.canUpdate {
+        Button("回退到 \(from)") {
+          Task { await model.rollback(report) }
+        }
+        .disabled(model.isBusy || model.upgradeRunning)
+      }
+    }
+  }
+
+  private static func outcomeTint(_ outcome: UpgradeReport.Outcome) -> Color {
+    switch outcome {
+    case .kept: return .green
+    case .rolledBack: return .orange
+    case .aborted: return .red
+    }
+  }
+
+  private static func checkSymbol(_ verdict: HarnessCheckResult.Verdict) -> String {
+    switch verdict {
+    case .pass: return "checkmark.circle.fill"
+    case .warn: return "exclamationmark.triangle.fill"
+    case .fail: return "xmark.octagon.fill"
+    case .skipped: return "minus.circle"
+    }
+  }
+
+  private static func checkTint(_ verdict: HarnessCheckResult.Verdict) -> Color {
+    switch verdict {
+    case .pass: return .green
+    case .warn: return .orange
+    case .fail: return .red
+    case .skipped: return .secondary
     }
   }
 
@@ -447,10 +579,23 @@ private struct RuntimePane: View {
                 .font(.caption2).foregroundStyle(.tertiary)
             }
             if release.id != model.activeReleaseID {
+              if model.canUpdate {
+                Button("更新并重启") {
+                  Task { await model.update(toReleaseID: release.id) }
+                }
+                .disabled(model.isBusy || model.upgradeRunning)
+                .help("激活这个版本、重启 harness 并自检；起不来就自动回到当前版本")
+              }
               Button("Activate") { Task { await model.activate(release.id) } }
                 .disabled(model.isBusy)
+                .help("只切换版本，不重启、不检查")
               Button("Remove") { Task { await model.remove(release.id) } }
-                .disabled(model.isBusy)
+                .disabled(!model.canRemove(release))
+                .help(
+                  model.pendingRollbackTarget == release.id
+                    ? "一次更新正把它当作回退目标，暂时不能删除"
+                    : "删除这个版本"
+                )
             } else {
               Text("active").font(.caption2).foregroundStyle(.secondary)
             }

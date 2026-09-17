@@ -16,8 +16,18 @@ public struct SessionSummary: Sendable, Equatable, Identifiable, Codable {
   public var messageCount: Int?
   public var model: String?
   public var provider: String?
+  /// The adapter-owned reasoning effort in force, when one is pinned. `nil` means the provider's
+  /// own default, which is a different state from any named tier.
+  public var reasoningEffort: String?
   public var parentID: SessionID?
   public var isLive: Bool
+  /// Whether this session belongs to a subagent rather than to the human.
+  ///
+  /// Kept as its own flag because the two ways a harness says so are independent: a child carries
+  /// the parent's id, while a session started as a subagent carries `origin: "subagent"` and may
+  /// have no recorded parent at all. Anything that decides "is this the user's own work" needs
+  /// both — a fan-out's sessions are exactly the ones that must not count as the user's activity.
+  public var isSubagent: Bool
 
   public init(
     id: SessionID,
@@ -32,8 +42,10 @@ public struct SessionSummary: Sendable, Equatable, Identifiable, Codable {
     messageCount: Int? = nil,
     model: String? = nil,
     provider: String? = nil,
+    reasoningEffort: String? = nil,
     parentID: SessionID? = nil,
-    isLive: Bool = false
+    isLive: Bool = false,
+    isSubagent: Bool = false
   ) {
     self.id = id
     self.title = title
@@ -47,8 +59,10 @@ public struct SessionSummary: Sendable, Equatable, Identifiable, Codable {
     self.messageCount = messageCount
     self.model = model
     self.provider = provider
+    self.reasoningEffort = reasoningEffort
     self.parentID = parentID
     self.isLive = isLive
+    self.isSubagent = isSubagent
   }
 
   /// What the browser shows as the row title.

@@ -11,10 +11,46 @@ import Foundation
 /// Parsing is total and forward-compatible, exactly like the forwarded-event stream: a frame whose
 /// `type` is unknown is `nil` rather than an error. The harness is allowed to add frame kinds, and
 /// a watcher that only wants turn boundaries must not break when it does.
+/// One durable event inside a snapshot page.
+///
+/// The page a follow stream opens with is history: the newest events the log already holds. A
+/// watcher that only ever reads live frames throws that away — right for the *first* subscription,
+/// and wrong for a re-subscription, where the page is precisely the gap the ended stream left. The
+/// records are kept (not just the cursor) so a caller can tell those two cases apart.
+public struct SessionFollowRecord: Sendable, Equatable {
+  public var type: String
+  public var seq: Int?
+  public var turn: Int?
+  public var data: JSONValue
+
+  public init(type: String, seq: Int? = nil, turn: Int? = nil, data: JSONValue = .null) {
+    self.type = type
+    self.seq = seq
+    self.turn = turn
+    self.data = data
+  }
+
+  /// Decode one page entry.
+  ///
+  /// The page and the live stream use the same envelope — `{type:"event", event:{…}}` — so a record
+  /// carries exactly the fields a frame's payload carries, and the two can be fed to one decoder.
+  public static func parse(_ value: JSONValue) -> SessionFollowRecord? {
+    guard let event = value["event"], let type = event["type"]?.stringValue else { return nil }
+    return SessionFollowRecord(
+      type: type,
+      seq: event["seq"]?.intValue,
+      turn: event["data"]?["turn"]?.intValue,
+      data: event["data"] ?? .null
+    )
+  }
+}
+
 public enum SessionFollowFrame: Sendable, Equatable {
   /// The opening frame. `cursor` is the log cut the snapshot was taken at, so a reader can page
-  /// history with `session/page` without racing the live stream.
-  case snapshot(cursor: Int)
+  /// history with `session/page` without racing the live stream. `records` is that cut's own page of
+  /// history, which a reconnecting reader needs in order not to lose what happened while it was
+  /// away.
+  case snapshot(cursor: Int, records: [SessionFollowRecord])
   /// One durable session event.
   case event(type: String, seq: Int?, turn: Int?, data: JSONValue)
   /// One process-local assistant presentation frame, which this client never asks for.
@@ -26,9 +62,12 @@ public enum SessionFollowFrame: Sendable, Equatable {
     guard let type = value["type"]?.stringValue else { return nil }
     switch type {
     case "snapshot":
-      // `cursor` is documented as a number and is the only field this type needs; a snapshot
+      // `cursor` is documented as a number and is the only field this frame needs; a snapshot
       // without it still opens the stream, so it defaults rather than failing the frame.
-      return .snapshot(cursor: value["cursor"]?.intValue ?? 0)
+      return .snapshot(
+        cursor: value["cursor"]?.intValue ?? 0,
+        records: (value["records"]?.arrayValue ?? []).compactMap { SessionFollowRecord.parse($0) }
+      )
     case "event":
       guard let event = value["event"] else { return nil }
       guard let eventType = event["type"]?.stringValue else { return nil }
@@ -124,6 +163,13 @@ public struct TurnCompletion: Sendable, Equatable {
   public var failureMessage: String?
   /// Whether the session is a subagent's, which the caller decides from the session list.
   public var isSubagent: Bool
+  /// The session's working directory, when the caller had one.
+  ///
+  /// Carried for one reason: a session's log is found under a path derived from this value, so
+  /// anything that wants to read what a finished turn *said* — the phone forwarder does — cannot
+  /// locate it without it. Optional because a notification does not need it, and a caller with no
+  /// session list (a test, a decode from a bare frame) must still be able to make one.
+  public var cwd: String?
 
   public init(
     sessionID: String,
@@ -132,7 +178,8 @@ public struct TurnCompletion: Sendable, Equatable {
     kind: TurnEndKind,
     failureCode: String? = nil,
     failureMessage: String? = nil,
-    isSubagent: Bool = false
+    isSubagent: Bool = false,
+    cwd: String? = nil
   ) {
     self.sessionID = sessionID
     self.sessionTitle = sessionTitle
@@ -141,6 +188,7 @@ public struct TurnCompletion: Sendable, Equatable {
     self.failureCode = failureCode
     self.failureMessage = failureMessage
     self.isSubagent = isSubagent
+    self.cwd = cwd
   }
 
   /// Decode one `turn/end` event.
@@ -153,7 +201,8 @@ public struct TurnCompletion: Sendable, Equatable {
     eventType: String,
     data: JSONValue,
     sessionTitle: String? = nil,
-    isSubagent: Bool = false
+    isSubagent: Bool = false,
+    cwd: String? = nil
   ) -> TurnCompletion? {
     guard eventType == EventType.turnEnd.rawValue else { return nil }
     let reason = data["reason"]
@@ -167,7 +216,8 @@ public struct TurnCompletion: Sendable, Equatable {
       kind: kind,
       failureCode: failure?["code"]?.stringValue,
       failureMessage: failure?["message"]?.stringValue,
-      isSubagent: isSubagent
+      isSubagent: isSubagent,
+      cwd: cwd
     )
   }
 }

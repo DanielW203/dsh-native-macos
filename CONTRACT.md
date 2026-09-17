@@ -68,6 +68,16 @@ the cached `workspaceID`, and unbinds the asking conversation. Registering the c
 still goes through the harness's own `workspace/create` RPC; nothing is written under
 `DSH_HOME`.
 
+Model and reasoning effort are editable from the phone the same way — by asking the harness, not
+by keeping a second copy of the truth. `/model` reads `session/modelCatalog` (the same catalog the
+desktop model menu renders), and `/model <n|id|provider/model>` plus `/effort <n|tier|默认>` call
+`session/selectModel`, whose selection the host validates against the live adapters and records
+durably on the session. The *current* value always comes back from the session list's
+`modelSelection` projection, so a change made in the desktop window shows up on the phone instead
+of being contradicted by it. A selection made before the conversation has a session is remembered
+in memory and installed on the next session the channel creates; nothing about it is persisted
+under `DSH_HOME`, and an existing session is never retargeted behind the user's back.
+
 Two app-level surfaces live in `HarnessUI`/`HarnessRuntime` rather than in their own modules,
 because each is a thin layer over a service that already exists:
 
@@ -78,6 +88,20 @@ because each is a thin layer over a service that already exists:
   outcome. `ApprovalPresenting` is the substitution seam for the notification centre (a test
   process has no bundle and no user to grant permission), and `SystemApprovalPresenter` adds
   the macOS category, the panel, and the delegate.
+- **Turn notifications and phone forwarding** (`Sources/HarnessUI/Approval/TurnCompletionWatcher.swift`,
+  `HarnessIM.WeChatChannelService.forwardTurnInfo`). `$events` carries approvals but never turn
+  endings, so endings come from `session/follow` — one socket per session, capped at the most
+  recently active eight. Two rules there are load-bearing, not cosmetic:
+  - *A snapshot is a baseline, not news.* The opening page is history on the **first** subscription
+    (an app restart must not replay yesterday's turns) and the **gap** on every reconnect. Measured
+    against a live harness: a subscription taken while a turn is running is closed almost immediately
+    (`session event stream skipped seq`), so a reconnect's page is exactly the ending that would
+    otherwise be lost — ignoring it made the phone receive nothing at all for any session in use.
+  - *Only a stream that carried a live frame earns a fast retry.* Resetting the backoff on a
+    successful *open* turns that immediate close into a storm: one session was re-snapshotting
+    ~160 KB/s of loopback traffic (2.3 GB in a few hours) while its log grew 25 B/s.
+  The forwarded text is the turn's plain text blocks only — never its reasoning, which the harness
+  writes first — and the session's `cwd`, carried on the watch target, is what locates the log.
 - **Session archives** (`Sources/HarnessRuntime/SessionArchive.swift`, UI in
   `Sources/HarnessUI/Backup/`). Export reads `$DSH_HOME/sessions` + `attachments` and writes
   one zip through `ditto`; import validates through `ArchiveInspector` before extracting, and

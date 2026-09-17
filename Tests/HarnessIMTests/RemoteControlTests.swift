@@ -62,6 +62,40 @@ final class ChatCommandParserTests: XCTestCase {
     XCTAssertEqual(ChatCommandParser.parse("/ws ~/Projects/x"), .command(.workspace("~/Projects/x")))
     XCTAssertEqual(ChatCommandParser.parse("/工作区 /tmp/a"), .command(.workspace("/tmp/a")))
   }
+
+  /// `/model` is the workspace shape with a second word: listing, target, or target + effort.
+  func testParsesModelForms() {
+    XCTAssertEqual(ChatCommandParser.parse("/model"), .command(.model(nil, effort: nil)))
+    XCTAssertEqual(ChatCommandParser.parse("/模型"), .command(.model(nil, effort: nil)))
+    XCTAssertEqual(ChatCommandParser.parse("/model 2"), .command(.model("2", effort: nil)))
+    XCTAssertEqual(ChatCommandParser.parse("/model 2 high"), .command(.model("2", effort: "high")))
+    XCTAssertEqual(
+      ChatCommandParser.parse("/model deepseek-chat"),
+      .command(.model("deepseek-chat", effort: nil))
+    )
+    // A phone keyboard inserts an ideographic space; it separates words like any other.
+    XCTAssertEqual(ChatCommandParser.parse("/model　2　high"), .command(.model("2", effort: "high")))
+    // Three words is a typo, not a model name — answering it as a sentence would be worse.
+    XCTAssertEqual(ChatCommandParser.parse("/model 2 high please"), .unknown("model"))
+  }
+
+  func testParsesEffortForms() {
+    XCTAssertEqual(ChatCommandParser.parse("/effort"), .command(.effort(nil)))
+    XCTAssertEqual(ChatCommandParser.parse("/思考"), .command(.effort(nil)))
+    XCTAssertEqual(ChatCommandParser.parse("/思考强度"), .command(.effort(nil)))
+    XCTAssertEqual(ChatCommandParser.parse("/effort high"), .command(.effort("high")))
+    XCTAssertEqual(ChatCommandParser.parse("/EFFORT High"), .command(.effort("High")))
+    XCTAssertEqual(ChatCommandParser.parse("/effort 2 3"), .unknown("effort"))
+  }
+
+  /// "默认" is how the phone asks for the provider's own default, which is a real operation:
+  /// the request then carries no effort field at all.
+  func testDefaultEffortAliases() {
+    for alias in ["默认", "默认强度", "default", "AUTO", "自动", "无"] {
+      XCTAssertTrue(ChatReply.isDefaultEffort(alias), alias)
+    }
+    XCTAssertFalse(ChatReply.isDefaultEffort("high"))
+  }
 }
 
 // MARK: - Reply text
@@ -187,6 +221,128 @@ final class ChatReplyTests: XCTestCase {
       ChatReply.alreadyInWorkspace(workspace("i", path: "/tmp/ws", title: "ws"))
         .contains("已经在这个工作区")
     )
+  }
+
+  // MARK: - Models and reasoning effort
+
+  private func catalog() -> HarnessModelCatalog {
+    HarnessModelCatalog(
+      defaultSelection: HarnessModelSelection(provider: "deepseek", model: "deepseek-chat"),
+      choices: [
+        HarnessModelChoice(
+          provider: "deepseek", providerName: "DeepSeek", model: "deepseek-chat",
+          name: "DeepSeek Chat",
+          efforts: [
+            HarnessModelEffort(id: "high", name: "高"),
+            HarnessModelEffort(id: "medium", name: "中"),
+          ],
+          defaultEffort: "medium"
+        ),
+        HarnessModelChoice(
+          provider: "deepseek", providerName: "DeepSeek", model: "deepseek-reasoner",
+          name: "DeepSeek Reasoner"
+        ),
+      ],
+      failures: [HarnessModelCatalog.Failure(id: "openai", name: "OpenAI", message: "no api key")]
+    )
+  }
+
+  func testModelListNumbersRowsMarksTheCurrentOneAndNamesTiers() {
+    let text = ChatReply.modelList(
+      catalog(),
+      current: HarnessModelSelection(provider: "deepseek", model: "deepseek-chat", reasoningEffort: "high")
+    )
+
+    XCTAssertTrue(text.contains("模型（共 2 个）"), text)
+    XCTAssertTrue(text.contains("当前：deepseek-chat · high"), text)
+    XCTAssertTrue(text.contains("1. ● DeepSeek Chat（deepseek-chat） · 强度 high"), text)
+    XCTAssertTrue(text.contains("2.   DeepSeek Reasoner（deepseek-reasoner）"), text)
+    XCTAssertTrue(text.contains("/model 2 high"), text)
+    XCTAssertTrue(text.contains("/effort 只调思考强度"), text)
+    // A provider that failed to enumerate itself is reported, not hidden.
+    XCTAssertTrue(text.contains("provider 枚举失败"), text)
+    XCTAssertTrue(text.contains("OpenAI"), text)
+  }
+
+  /// Without a session the switch is still recorded, so the footer has to promise the *other*
+  /// outcome rather than claim it already took effect.
+  func testModelListWithoutASessionSaysWhenItApplies() {
+    let text = ChatReply.modelList(catalog(), current: nil, bound: false)
+    XCTAssertFalse(text.contains("当前："), text)
+    XCTAssertTrue(text.contains("下一条消息开的新会话上生效"), text)
+    XCTAssertTrue(text.contains("还没有绑定会话"), text)
+  }
+
+  func testModelListCapsLongCatalogs() {
+    let many = (1...18).map {
+      HarnessModelChoice(
+        provider: "deepseek", providerName: "DeepSeek", model: "model-\($0)", name: "Model \($0)"
+      )
+    }
+    let text = ChatReply.modelList(
+      HarnessModelCatalog(choices: many),
+      current: nil,
+      bound: true,
+      limit: 12
+    )
+    XCTAssertTrue(text.contains("只显示了前 12 个，共 18 个"), text)
+    XCTAssertFalse(text.contains("13. "), text)
+  }
+
+  /// Group headers appear only when the catalog actually spans providers; a single-provider list
+  /// does not need them.
+  func testModelListShowsProviderHeadersOnlyWhenThereIsMoreThanOne() {
+    let two = HarnessModelCatalog(choices: [
+      HarnessModelChoice(provider: "deepseek", providerName: "DeepSeek", model: "a", name: "A"),
+      HarnessModelChoice(provider: "openai", providerName: "OpenAI", model: "b", name: "B"),
+    ])
+    let text = ChatReply.modelList(two, current: nil)
+    XCTAssertTrue(text.contains("【DeepSeek】"), text)
+    XCTAssertTrue(text.contains("【OpenAI】"), text)
+    XCTAssertFalse(ChatReply.modelList(catalog(), current: nil).contains("【"))
+  }
+
+  func testEffortListMarksTheCurrentTier() {
+    let choice = catalog().choices[0]
+    let text = ChatReply.effortList(
+      choice,
+      current: HarnessModelSelection(provider: "deepseek", model: "deepseek-chat", reasoningEffort: "medium")
+    )
+    XCTAssertTrue(text.contains("当前：medium"), text)
+    XCTAssertTrue(text.contains("1.   high（高）"), text)
+    XCTAssertTrue(text.contains("2. ● medium（中）"), text)
+    XCTAssertTrue(text.contains("/effort 默认"), text)
+  }
+
+  func testEffortListExplainsAModelWithoutTiers() {
+    let text = ChatReply.effortList(catalog().choices[1], current: nil)
+    XCTAssertTrue(text.contains("不支持调思考强度"), text)
+  }
+
+  func testModelSelectedPromisesTheRightThing() {
+    let selection = HarnessModelSelection(provider: "deepseek", model: "deepseek-reasoner", reasoningEffort: "high")
+    let applied = ChatReply.modelSelected(selection, bound: true)
+    XCTAssertTrue(applied.contains("模型已切换：deepseek-reasoner"), applied)
+    XCTAssertTrue(applied.contains("思考强度：high"), applied)
+    XCTAssertTrue(applied.contains("下一条消息就会用它"), applied)
+
+    let remembered = ChatReply.modelSelected(selection, bound: false)
+    XCTAssertTrue(remembered.contains("已经记下"), remembered)
+
+    XCTAssertTrue(
+      ChatReply.modelSelected(HarnessModelSelection(provider: "p", model: "m"), bound: true)
+        .contains("思考强度：默认强度")
+    )
+  }
+
+  func testModelFailuresSayWhatToDoNext() {
+    XCTAssertTrue(ChatReply.modelNotFound("gpt-5").contains("没有找到模型「gpt-5」"))
+    XCTAssertTrue(ChatReply.modelNotFound("9").contains("/model 看编号"))
+    let unknown = ChatReply.effortNotFound("特高", choice: catalog().choices[0])
+    XCTAssertTrue(unknown.contains("没有找到思考强度「特高」"), unknown)
+    XCTAssertTrue(unknown.contains("high、medium"), unknown)
+    XCTAssertTrue(ChatReply.effortNeedsModel().contains("先发 /model"))
+    XCTAssertTrue(ChatReply.effortUnsupported(catalog().choices[1]).contains("不支持调思考强度"))
   }
 }
 

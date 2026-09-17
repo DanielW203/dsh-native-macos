@@ -47,6 +47,7 @@ PUBLISH=(
   Vendor
   Spec
   Tools
+  docs
   Package.swift
   README.md
   CONTRACT.md
@@ -173,7 +174,7 @@ run_self_test() {
   tmp="$(mktemp -d -t export-public-selftest)"
   src="$tmp/src"
   # 让白名单里的每一项都存在，否则自检会打印一堆「已跳过」的噪声。
-  mkdir -p "$src/Apps" "$src/Tools" "$src/Spec" "$src/Sources" "$src/Tests" "$src/Vendor"
+  mkdir -p "$src/Apps" "$src/Tools" "$src/Spec" "$src/Sources" "$src/Tests" "$src/Vendor" "$src/docs"
   : > "$src/Package.swift"
   : > "$src/CONTRACT.md"
   : > "$src/LICENSE"
@@ -273,9 +274,12 @@ fi
 # ── 4. 补上游 MIT 归属声明（幂等）────────────────────────────────────────────
 # 注：文档与脚本里的本机路径、上游仓库目录名已经由仓库自身保持中性
 # （README 用 /path/to/... ，上游统一用 official-dsh/ 记号），此处不再改写文档。
-LICENSE="$DEST/LICENSE"
-if [ -f "$LICENSE" ] && ! grep -q 'Derived specification files' "$LICENSE"; then
-  cat >> "$LICENSE" <<'EOF'
+# 归属声明写进 NOTICE.md，**不写进 LICENSE**：往 LICENSE 追加任何内容都会让
+# GitHub 的许可证识别失败（侧栏显示 NOASSERTION 而不是 MIT），而识别的依据必须是
+# 一份逐字的标准 MIT 文本。
+ATTRIBUTION="$DEST/NOTICE.md"
+if [ -f "$ATTRIBUTION" ] && ! grep -q 'Derived specification files' "$ATTRIBUTION"; then
+  cat >> "$ATTRIBUTION" <<'EOF'
 
 ---
 
@@ -289,7 +293,7 @@ redistributed here under the same MIT terms with this attribution:
 - `Sources/HarnessCore/Tools/Generated/ToolSchemas.swift` — generated from the
   official tool catalog
 EOF
-  echo "  已补充: LICENSE 的上游 MIT 归属声明"
+  echo "  已补充: NOTICE.md 的上游 MIT 归属声明"
 fi
 
 # ── 5. 体检报告 ─────────────────────────────────────────────────────────────

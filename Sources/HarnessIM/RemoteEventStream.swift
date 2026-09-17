@@ -77,26 +77,45 @@ public final class RemoteEventStream: RemoteEventStreaming, @unchecked Sendable 
   private let webSocketURL: URL
   private let cookie: String?
   private let session: URLSession
+  /// Whether `close()` should take the session down with it.
+  ///
+  /// A borrowed session belongs to the transport that lent it — the channel's HTTP calls run on
+  /// the same pool, so invalidating it here would break every later request.
+  private let ownsSession: Bool
   private let stateLock = NSLock()
   private var socket: URLSessionWebSocketTask?
   private var clientID: String?
 
-  public init(client: HarnessAPIClient, webSocketURL: URL, cookie: String?) {
+  public init(client: HarnessAPIClient, webSocketURL: URL, cookie: String?, session borrowed: URLSession? = nil) {
     self.client = client
     self.webSocketURL = webSocketURL
     self.cookie = cookie
-    let configuration = URLSessionConfiguration.ephemeral
-    // The stream is long-lived by design; no request timeout may cut it.
-    configuration.timeoutIntervalForRequest = 24 * 60 * 60
-    session = URLSession(configuration: configuration)
+    if let borrowed {
+      session = borrowed
+      ownsSession = false
+    } else {
+      let configuration = URLSessionConfiguration.ephemeral
+      // The stream is long-lived by design; no request timeout may cut it.
+      configuration.timeoutIntervalForRequest = 24 * 60 * 60
+      session = URLSession(configuration: configuration)
+      ownsSession = true
+    }
+  }
+
+  deinit {
+    if ownsSession { session.invalidateAndCancel() }
   }
 
   public func open() async throws -> AsyncThrowingStream<RemoteEventFrame, Error> {
     let streamID = UUID().uuidString
     var request = URLRequest(url: webSocketURL)
     if let cookie, !cookie.isEmpty { request.setValue(cookie, forHTTPHeaderField: "Cookie") }
+    // The previous socket is dead the moment a new attempt starts, and a socket nobody cancels
+    // is a descriptor nobody releases: the reconnect loop is the one path that runs often enough
+    // for that to exhaust the process.
+    takeSocket()?.cancel(with: .goingAway, reason: nil)
     let task = session.webSocketTask(with: request)
-    stateLock.lock(); socket = task; stateLock.unlock()
+    adopt(task)
     task.resume()
 
     let open: JSONValue = .object([
@@ -105,11 +124,20 @@ public final class RemoteEventStream: RemoteEventStreaming, @unchecked Sendable 
       "endpoint": .string("$events"),
       "payload": .object(["args": .object([:])]),
     ])
-    try await send(task, open)
+    do {
+      try await send(task, open)
+    } catch {
+      // The open frame never went out, so no pump will ever release this socket.
+      release(task)
+      throw error
+    }
 
     return AsyncThrowingStream { continuation in
       let pump = Task { [weak self] in
         guard let self else { return }
+        // Every way this stream can end — peer close, error, cancellation — releases the
+        // socket, not just the explicit `close()`.
+        defer { self.release(task) }
         do {
           while !Task.isCancelled {
             let message = try await task.receive()
@@ -120,7 +148,7 @@ public final class RemoteEventStream: RemoteEventStreaming, @unchecked Sendable 
             case "item":
               guard let value = envelope["value"], let frame = RemoteEventFrame.parse(value) else { continue }
               if case .ready(let id) = frame {
-                self.stateLock.lock(); self.clientID = id; self.stateLock.unlock()
+                self.setClientID(id)
               }
               continuation.yield(frame)
             case "error":
@@ -161,11 +189,43 @@ public final class RemoteEventStream: RemoteEventStreaming, @unchecked Sendable 
   }
 
   public func close() async {
-    stateLock.lock()
+    takeSocket()?.cancel(with: .goingAway, reason: nil)
+    clearClientID()
+    // Only a session this stream created is this stream's to take down.
+    if ownsSession { session.invalidateAndCancel() }
+  }
+
+  /// Install a freshly opened socket as the current one.
+  private func adopt(_ task: URLSessionWebSocketTask) {
+    stateLock.lock(); socket = task; stateLock.unlock()
+  }
+
+  private func clearClientID() {
+    stateLock.lock(); clientID = nil; stateLock.unlock()
+  }
+
+  private func setClientID(_ id: String) {
+    stateLock.lock(); clientID = id; stateLock.unlock()
+  }
+
+  /// Remove and return the current socket, so two callers cannot both own it.
+  private func takeSocket() -> URLSessionWebSocketTask? {
+    stateLock.lock(); defer { stateLock.unlock() }
     let task = socket
     socket = nil
+    return task
+  }
+
+  /// Cancel one socket, and forget it only while it is still the current one.
+  ///
+  /// The captured task is cancelled unconditionally — if a reconnect already replaced it, that
+  /// replacement is the reason it is dead — but only the current socket may be cleared, or a
+  /// late finish would erase its successor.
+  private func release(_ task: URLSessionWebSocketTask) {
+    task.cancel(with: .goingAway, reason: nil)
+    stateLock.lock()
+    if socket === task { socket = nil }
     stateLock.unlock()
-    task?.cancel(with: .goingAway, reason: nil)
   }
 
   func currentClientID() -> String? {

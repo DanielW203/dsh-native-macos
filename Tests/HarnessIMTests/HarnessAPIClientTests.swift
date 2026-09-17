@@ -286,6 +286,147 @@ final class HarnessAPIClientTests: XCTestCase {
     try await client.rename(sessionID: "session-1", title: "   ")
     XCTAssertEqual(transport.calls.count, 1, "a blank title is not worth a round trip")
   }
+
+  // MARK: - Model selection
+
+  /// A two-group catalog with one model that has tiers, one that has none, and one provider that
+  /// failed to enumerate itself — the three shapes the phone listing has to survive.
+  private static let catalogJSON = #"""
+  {
+    "default": {"provider": "deepseek", "model": "deepseek-chat"},
+    "routableProviders": ["deepseek", "openai"],
+    "groups": [
+      {
+        "id": "deepseek",
+        "name": "DeepSeek",
+        "models": [
+          {
+            "id": "deepseek-chat",
+            "name": "DeepSeek Chat",
+            "description": "通用对话",
+            "reasoning": {
+              "efforts": [{"id": "high", "name": "高"}, {"id": "medium", "name": "中"}],
+              "defaultEffort": "medium"
+            }
+          },
+          {"id": "deepseek-reasoner", "name": "DeepSeek Reasoner"}
+        ]
+      }
+    ],
+    "failures": [{"id": "openai", "name": "OpenAI", "message": "no api key"}]
+  }
+  """#
+
+  func testModelCatalogDecodesGroupsEffortsAndFailures() async throws {
+    let transport = StubHarnessTransport { call in
+      XCTAssertEqual(call.path, "http://127.0.0.1:1/api/session/modelCatalog")
+      return okResponse(Self.catalogJSON)
+    }
+    let client = HarnessAPIClient(baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:1")), transport: transport)
+    let catalog = try await client.modelCatalog()
+
+    // The gateway validates `args` strictly against the descriptor: no parameters means an empty
+    // *object*, not an empty array and not a `_request` wrapper.
+    let args = try XCTUnwrap(try JSONValue.parse(try XCTUnwrap(transport.calls.first?.body)).path("payload.args"))
+    XCTAssertEqual(args.objectValue?.isEmpty, true, "args must be {}")
+
+    XCTAssertEqual(catalog.defaultSelection?.model, "deepseek-chat")
+    XCTAssertEqual(catalog.choices.map(\.model), ["deepseek-chat", "deepseek-reasoner"])
+    XCTAssertEqual(catalog.choices.first?.providerName, "DeepSeek")
+    XCTAssertEqual(catalog.choices.first?.efforts.map(\.id), ["high", "medium"])
+    XCTAssertEqual(catalog.choices.first?.defaultEffort, "medium")
+    XCTAssertTrue(catalog.choices[1].efforts.isEmpty, "a model with no reasoning block has no tiers")
+    XCTAssertEqual(catalog.failures.map(\.id), ["openai"])
+
+    // Resolution is by id, by `provider/model`, and case-insensitively.
+    XCTAssertEqual(catalog.choice(matching: "DeepSeek-Chat")?.model, "deepseek-chat")
+    XCTAssertEqual(catalog.choice(matching: "deepseek/deepseek-reasoner")?.model, "deepseek-reasoner")
+    XCTAssertNil(catalog.choice(matching: "gpt-5"))
+    // A model's own tiers, matched by id or by the display name the phone shows.
+    XCTAssertEqual(catalog.choices[0].effort(matching: "高")?.id, "high")
+    XCTAssertNil(catalog.choices[1].effort(matching: "high"))
+  }
+
+  /// The wire shape is a private contract: `request` is the parameter name, and an unset effort
+  /// has to be *absent* rather than empty, because the two are different requests to the host.
+  func testSelectModelSendsTheTripleAndOmitsUnsetEffort() async throws {
+    let transport = StubHarnessTransport { _ in
+      okResponse(#"{"selected":{"provider":"deepseek","model":"deepseek-chat","reasoningEffort":"high"}}"#)
+    }
+    let client = HarnessAPIClient(baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:1")), transport: transport)
+
+    let selected = try await client.selectModel(
+      sessionID: "session-1", provider: "deepseek", model: "deepseek-chat", reasoningEffort: "high"
+    )
+    XCTAssertEqual(selected, HarnessModelSelection(provider: "deepseek", model: "deepseek-chat", reasoningEffort: "high"))
+    XCTAssertEqual(transport.calls.first?.path, "http://127.0.0.1:1/api/session/selectModel")
+    let request = try XCTUnwrap(
+      try JSONValue.parse(try XCTUnwrap(transport.calls.first?.body)).path("payload.args.request")
+    )
+    XCTAssertEqual(request["sessionId"]?.stringValue, "session-1")
+    XCTAssertEqual(request["provider"]?.stringValue, "deepseek")
+    XCTAssertEqual(request["reasoningEffort"]?.stringValue, "high")
+
+    _ = try await client.selectModel(sessionID: "session-1", provider: "deepseek", model: "deepseek-chat")
+    let plain = try XCTUnwrap(
+      try JSONValue.parse(try XCTUnwrap(transport.calls.last?.body)).path("payload.args.request")
+    )
+    XCTAssertNil(plain["reasoningEffort"], "no preference must be spelled as an absent field")
+  }
+
+  func testSelectModelRejectsAPayloadWithoutASelection() async throws {
+    let transport = StubHarnessTransport { _ in okResponse("{}") }
+    let client = HarnessAPIClient(baseURL: try XCTUnwrap(URL(string: "http://127.0.0.1:1")), transport: transport)
+    do {
+      _ = try await client.selectModel(sessionID: "session-1", provider: "p", model: "m")
+      XCTFail("a malformed answer must not read as a successful switch")
+    } catch {
+      XCTAssertEqual((error as? HarnessAPIError)?.code, .malformedEnvelope)
+    }
+  }
+
+  /// `/model` reports what the session will run next, which is the `modelSelection` projection —
+  /// the same value the desktop menu shows, so a change made there is visible to the phone.
+  func testSessionListCarriesTheProjectedModelSelection() async throws {
+    let payload = #"""
+    {"items":[{"sessionId":"session-1","cwd":"/tmp/x","updatedAt":1700000000000,"running":false,
+      "projections":{"values":{"title":"微信 · owner","modelSelection":{"lastUsed":{"provider":"deepseek","model":"old"},
+      "next":{"provider":"deepseek","model":"deepseek-reasoner","reasoningEffort":"high"}}}}}]}
+    """#
+    let summaries = HarnessAPIClient.sessionSummaries(from: try JSONValue.parse(payload))
+    XCTAssertEqual(summaries.count, 1)
+    XCTAssertEqual(summaries[0].modelSelection?.model, "deepseek-reasoner")
+    XCTAssertEqual(summaries[0].reasoningEffort, "high")
+
+    // A host too old to project it simply carries no model, rather than a wrong one.
+    let bare = HarnessAPIClient.sessionSummaries(
+      from: try JSONValue.parse(#"{"items":[{"sessionId":"session-2","cwd":"/tmp/x"}]}"#)
+    )
+    XCTAssertNil(bare[0].modelSelection)
+  }
+
+  /// Subagent-ness arrives as two independent signals, and both have to be read: the turn watcher
+  /// uses it to decide which sessions are worth following and pushing, so a fan-out that looked
+  /// like the user's own work would take their slots and send their turns to the phone.
+  func testSessionListMarksSubagentSessions() throws {
+    let payload = #"""
+    {"items":[
+      {"sessionId":"session-root","cwd":"/tmp/x","updatedAt":1700000000000},
+      {"sessionId":"session-child","cwd":"/tmp/x","updatedAt":1700000000000,"parentSessionId":"session-root"},
+      {"sessionId":"session-origin","cwd":"/tmp/x","updatedAt":1700000000000,"origin":"subagent"}
+    ]}
+    """#
+    let rows = HarnessAPIClient.sessionSummaries(from: try JSONValue.parse(payload))
+    XCTAssertEqual(rows.map(\.id.rawValue), ["session-root", "session-child", "session-origin"])
+    XCTAssertEqual(rows.map(\.isSubagent), [false, true, true])
+    XCTAssertEqual(rows[1].parentID?.rawValue, "session-root")
+    // An empty parent id is not a parent.
+    let blank = HarnessAPIClient.sessionSummaries(
+      from: try JSONValue.parse(#"{"items":[{"sessionId":"session-3","parentSessionId":""}]}"#)
+    )
+    XCTAssertFalse(blank[0].isSubagent)
+    XCTAssertNil(blank[0].parentID)
+  }
 }
 
 final class HarnessAPICompatibilityTests: XCTestCase {

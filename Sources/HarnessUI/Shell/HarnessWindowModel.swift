@@ -34,6 +34,13 @@ public final class HarnessWindowModel: ObservableObject {
   /// What a Node install is doing right now, for the panel under the button.
   @Published public private(set) var nodeStage: String?
   @Published public private(set) var webModel: HarnessWebModel?
+  /// The last runtime-version change this window performed, kept so the console can show it
+  /// and so a failure survives the panel being closed.
+  ///
+  /// Published on the window rather than held by the console because the window is the
+  /// server's owner: the upgrade moves the server, and a report of what happened to it
+  /// belongs beside the thing it happened to.
+  @Published public private(set) var upgradeReport: UpgradeReport?
 
   /// The profile this window boots.
   ///
@@ -83,6 +90,13 @@ public final class HarnessWindowModel: ObservableObject {
   /// already in flight stops the server it produced instead of handing it to a window that
   /// is about to disappear — see `startUnchecked(clearingLog:)`.
   private var isQuitting = false
+  /// Moves the runtime between installed releases. `nil` in a build with no paths wired for
+  /// it, which turns the console's update button into an absent one rather than a dead one.
+  private var upgrader: HarnessUpgradeCoordinator?
+  /// The launch-time resume runs once per launch. Without this, a boot that fails and is
+  /// retried by the user would re-run the resume against a marker the upgrade already
+  /// resolved.
+  private var didResumeUpgrade = false
 
   public init(
     launcher: any HarnessLaunching,
@@ -129,7 +143,7 @@ public final class HarnessWindowModel: ObservableObject {
   ) -> HarnessWindowModel {
     let installer = HarnessInstaller(paths: paths)
     let entry: @Sendable () async throws -> URL = { try await installer.activeEntryURL() }
-    return HarnessWindowModel(
+    let model = HarnessWindowModel(
       launcher: HarnessLauncher(paths: paths, entryProvider: entry),
       profile: profile,
       logFileURL: logFileURL,
@@ -144,6 +158,13 @@ public final class HarnessWindowModel: ObservableObject {
       // be written, reported, and then thrown away unread.
       checkpoints: paths.isSafeMode ? nil : ProfileCheckpointStore(paths: paths)
     )
+    // Attached after the fact because the coordinator drives this window's own start and stop,
+    // and the window does not exist until the call above returns. Skipped in Safe Mode: a
+    // disposable home is the wrong place to leave a marker about the user's real runtime.
+    if !paths.isSafeMode {
+      model.attachUpgrader(paths: paths, installer: installer)
+    }
+    return model
   }
 
   /// `~/Documents` rather than the home directory: a harness pointed at `~` offers the
@@ -172,6 +193,9 @@ public final class HarnessWindowModel: ObservableObject {
     guard !didAutoStart else { return }
     didAutoStart = true
     await start()
+    // After the boot, never before: an interrupted upgrade is decided by whether the release
+    // it moved to actually came up, and that answer only exists once this attempt finished.
+    await resumeUpgradeIfNeeded()
   }
 
   public func start() async {
@@ -528,6 +552,109 @@ public final class HarnessWindowModel: ObservableObject {
     NSWorkspace.shared.open(parsed)
   }
 
+  // MARK: - Upgrading
+
+  /// Give this window the ability to move the runtime between installed releases.
+  ///
+  /// Called by the factory that built the window, because the coordinator needs the window it
+  /// is driving and that window does not exist yet while the factory is still running. The
+  /// runtime is driven through this window rather than by the coordinator directly for the
+  /// same reason the console's own text warns about a second server: this window owns the
+  /// port and the WebView attached to it.
+  public func attachUpgrader(paths: RuntimePaths, installer: HarnessInstaller) {
+    let profile = self.profile
+    upgrader = HarnessUpgradeCoordinator(
+      paths: paths,
+      installer: installer,
+      profile: profile,
+      stopRuntime: { [weak self] in await self?.stopForUpgrade() },
+      startRuntime: { [weak self] in
+        guard let self else {
+          throw RuntimeError.installFailed(step: "harness boot", detail: "窗口已关闭")
+        }
+        return try await self.startForUpgrade()
+      },
+      currentRuntime: { [weak self] in await self?.currentRuntimeState() },
+      makeChecks: { announcedURL in
+        // The audit is against the release that is active *now* — at this point in an
+        // upgrade that is the new one, which is the only version the answer can be about.
+        let active = (try? await installer.index())?.active
+        return await HarnessUpgradeChecks.make(
+          announcedURL: announcedURL,
+          paths: paths,
+          profile: profile,
+          activeReleaseID: active
+        )
+      },
+      progress: { [weak self] line in
+        Task { @MainActor in self?.record(line) }
+      }
+    )
+  }
+
+  /// Whether this build wired an upgrader at all.
+  public var canUpgradeRuntime: Bool { upgrader != nil }
+
+  /// Move the runtime to another installed release, with automatic fallback.
+  ///
+  /// Returns the report rather than only publishing it, so the console — which cannot see
+  /// this module — can show the outcome in the window the user pressed the button in.
+  public func updateHarness(toReleaseID id: String) async -> UpgradeReport {
+    guard !isBusy else {
+      return UpgradeReport(toReleaseID: id, outcome: .aborted, summary: "窗口正忙，本次更新未执行。")
+    }
+    guard let upgrader else {
+      return UpgradeReport(toReleaseID: id, outcome: .aborted, summary: "这个构建没有接入版本更新。")
+    }
+    isBusy = true
+    defer { isBusy = false }
+    let report = await upgrader.update(toReleaseID: id)
+    upgradeReport = report
+    return report
+  }
+
+  /// Finish an upgrade that a crash interrupted, once per launch.
+  ///
+  /// Called after the window has made its own boot attempt, so "the new release is active and
+  /// up" and "the new release is active and down" are already decided. Returns nothing when
+  /// there was no upgrade in flight — the common case.
+  public func resumeUpgradeIfNeeded() async {
+    guard !didResumeUpgrade, let upgrader else { return }
+    didResumeUpgrade = true
+    guard let report = await upgrader.resumeIfNeeded() else { return }
+    upgradeReport = report
+  }
+
+  /// A boot for the coordinator: the same start the button runs, but its failure is thrown
+  /// rather than only displayed.
+  ///
+  /// The display half still happens — `startUnchecked` fills in the failure panel — because
+  /// the user should see the reason in the window they are looking at, not only in a report.
+  private func startForUpgrade() async throws -> HarnessServerState {
+    // `clearingLog: false`: the lines this boot prints are the outcome of the upgrade, and
+    // wiping them would destroy the evidence the report is about.
+    await startUnchecked(clearingLog: false)
+    if phase == .running, let url {
+      return HarnessServerState(phase: .running, url: url, detail: nil)
+    }
+    throw RuntimeError.installFailed(step: "harness boot", detail: detail ?? "harness 未能启动")
+  }
+
+  private func stopForUpgrade() async {
+    await stopUnchecked()
+  }
+
+  /// What the launcher reports right now, rather than what this window last cached.
+  ///
+  /// The distinction matters: a harness that died on its own leaves this window still saying
+  /// "running", and a rollback decision made from that stale value would be about a server
+  /// that is not there.
+  private func currentRuntimeState() async -> HarnessServerState? {
+    let reported = await launcher.state()
+    guard reported.phase == .running, reported.url?.isEmpty == false else { return nil }
+    return reported
+  }
+
   /// Quit the app and start it again.
   ///
   /// A reload re-fetches the page; this is for what a page cannot change — the workspace
@@ -653,7 +780,11 @@ public final class HarnessWindowModel: ObservableObject {
   // MARK: - Plumbing
 
   private func attachWebModel(to base: URL) {
-    guard webModel?.webView.url?.host != base.host else { return }
+    // The *address* decides, not the host. Every harness start picks a new port, so a
+    // comparison that only looks at "127.0.0.1" keeps a window pinned to a server that is
+    // gone: the page it holds still renders, then fails every request it makes — the
+    // client-plugin bundles first — while the toolbar confidently reports "running".
+    guard webModel?.webView.url.map(Self.address(of:)) != Self.address(of: base) else { return }
     record("harness URL: \(Self.address(of: base))")
     let model = HarnessWebModel(
       baseURL: base,

@@ -82,7 +82,9 @@ struct DSHNativeApp: App {
       // deleted.
       dshHome: { base.dshHome }
     )
-    _wechat = StateObject(wrappedValue: WeChatChannelModel(
+    // Held in a local because two owners need it: the scene's `StateObject`, and the alert model
+    // below, which forwards finished turns to the phone through it.
+    let channelModel = WeChatChannelModel(
       service: channelService,
       initialConfig: ChannelConfig(),
       // Read through defaults rather than the window model: this runs during app init, before
@@ -93,7 +95,8 @@ struct DSHNativeApp: App {
       }
       // (evaluated on the main actor: the app's init is main-actor isolated, which is where
       //  `defaultWorkspace` is reachable from)
-    ))
+    )
+    _wechat = StateObject(wrappedValue: channelModel)
 
     // The notification delegate must be in place before the app finishes launching, or
     // macOS drops the actions of every notification button — so the presenter is built
@@ -103,6 +106,11 @@ struct DSHNativeApp: App {
       urlProvider: { DSHNativeApp.harnessURL.value },
       presenter: presenter
     )
+    // Wired here rather than inside either model: the phone is the channel's business and the
+    // "which endings are news" judgement is the alert model's, and neither should have to know the
+    // other to be testable. Both are built in this initializer, so this is the one place that has
+    // both. Nothing is sent unless 手机远控 is switched on.
+    alerts.phoneForwarder = channelModel
     alerts.onOpenAlert = { _ in
       // A click on the notification body: come to the front and show the page that owns
       // the request. The reload is what makes the Web UI re-read the session list rather
@@ -285,13 +293,8 @@ private struct HarnessMenu: Commands {
       }
       .keyboardShortcut("p", modifiers: [.command, .option])
 
-      Button("DSH Market…") {
-        openWindow(id: HarnessWindowID.market)
-      }
-      .keyboardShortcut("m", modifiers: [.command, .shift])
-      // The market is a client plugin inside the harness Web UI. A Safe Mode start has no
-      // client plugins at all, so the window would host a page with nothing on it.
-      .disabled(safeBoot.isSafe)
+      // No "DSH Market…" item: the market window scene below is kept for a future entry
+      // point, but the menu no longer offers it.
 
       Button("Harness Console…") {
         openWindow(id: HarnessWindowID.console)

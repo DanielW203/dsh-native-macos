@@ -22,10 +22,20 @@ final class ScriptedILinkTransport: ILinkHTTPTransport, @unchecked Sendable {
   private var sentTexts: [String] = []
   private var started = false
   private var stopped = false
+  private var polls = 0
+
+  /// When set, every `getupdates` answers this body instead of the script — the provider
+  /// refusing the call rather than the account.
+  var pollRejection: String?
 
   /// - Parameter batches: successive `getupdates` payloads; afterwards the poll is empty.
   init(batches: [[String]]) {
     self.queue = batches
+  }
+
+  var pollCount: Int {
+    lock.lock(); defer { lock.unlock() }
+    return polls
   }
 
   var sentMessages: [String] {
@@ -68,8 +78,13 @@ final class ScriptedILinkTransport: ILinkHTTPTransport, @unchecked Sendable {
     }
     if url.contains("getupdates") {
       lock.lock()
-      let next = queue.isEmpty ? nil : queue.removeFirst()
+      polls += 1
+      let rejection = pollRejection
+      // A refusal must not consume the script: the messages still belong to the next poll that
+      // actually succeeds.
+      let next = (rejection == nil && !queue.isEmpty) ? queue.removeFirst() : nil
       lock.unlock()
+      if let rejection { return ILinkHTTPResponse(status: 200, body: Data(rejection.utf8)) }
       let messages = next ?? []
       let payload = #"{"ret":0,"msgs":[\#(messages.joined(separator: ","))],"get_updates_buf":"buf"}"#
       return ILinkHTTPResponse(status: 200, body: Data(payload.utf8))
@@ -107,7 +122,10 @@ final class WeChatChannelServiceTests: XCTestCase {
     reply: HarnessReply? = HarnessReply(text: "结果是 42", turn: 1, reason: "completed", isComplete: true),
     config: ChannelConfig? = nil,
     approvalStream: StubRemoteEventStream? = nil,
-    sessionList: String? = nil
+    sessionList: String? = nil,
+    modelCatalog: String? = nil,
+    selectModelResult: String? = nil,
+    onHarnessTransportCreate: (@Sendable () -> Void)? = nil
   ) async throws -> (WeChatChannelService, ScriptedILinkTransport, StubHarnessTransport, Box) {
     let providerTransport = ScriptedILinkTransport(batches: batches)
     let recorder = Box()
@@ -120,6 +138,30 @@ final class WeChatChannelServiceTests: XCTestCase {
       if let sessionList, call.path.hasSuffix("session/list") {
         return HarnessAPIResponse(status: 200, body: Data(
           #"{"type":"server-response","rpcId":"x","result":{"ok":true,"value":\#(sessionList)}}"#.utf8
+        ))
+      }
+      if let modelCatalog, call.path.hasSuffix("session/modelCatalog") {
+        return HarnessAPIResponse(status: 200, body: Data(
+          #"{"type":"server-response","rpcId":"x","result":{"ok":true,"value":\#(modelCatalog)}}"#.utf8
+        ))
+      }
+      if call.path.hasSuffix("session/selectModel") {
+        if let selectModelResult {
+          return HarnessAPIResponse(status: 200, body: Data(
+            #"{"type":"server-response","rpcId":"x","result":{"ok":true,"value":\#(selectModelResult)}}"#.utf8
+          ))
+        }
+        // The host's answer, defaulted to echoing what it was asked for: the selection it
+        // installs is what `/model` reports back, so the test asserts on the real read-back.
+        let request = call.body.flatMap { try? JSONValue.parse($0) }?.path("payload.args.request")
+        let provider = request?["provider"]?.stringValue ?? ""
+        let model = request?["model"]?.stringValue ?? ""
+        let effort = request?["reasoningEffort"]?.stringValue
+        let selected = effort.map {
+          #"{"provider":"\#(provider)","model":"\#(model)","reasoningEffort":"\#($0)"}"#
+        } ?? #"{"provider":"\#(provider)","model":"\#(model)"}"#
+        return HarnessAPIResponse(status: 200, body: Data(
+          #"{"type":"server-response","rpcId":"x","result":{"ok":true,"value":{"selected":\#(selected)}}}"#.utf8
         ))
       }
       if call.path.hasSuffix("workspace/create") {
@@ -166,7 +208,10 @@ final class WeChatChannelServiceTests: XCTestCase {
       dshHome: { self.root.appendingPathComponent("home") },
       client: ILinkClient(transport: providerTransport),
       replyConfiguration: .init(pollInterval: .milliseconds(20), timeout: .seconds(5)),
-      harnessTransport: { harnessTransport },
+      harnessTransport: {
+        onHarnessTransportCreate?()
+        return harnessTransport
+      },
       replySourceFactory: { _, _, _ in StubReplySource(replies: reply.map { [$0] } ?? []) },
       approvalStreamFactory: { _ in approvalStream ?? StubRemoteEventStream(frames: []) }
     )
@@ -204,6 +249,12 @@ final class WeChatChannelServiceTests: XCTestCase {
         call.body.flatMap { try? JSONValue.parse($0) }
       }
     }
+    /// The `request` half of every `session/selectModel` call, in order.
+    var modelSelections: [JSONValue] {
+      all.filter { $0.path.hasSuffix("session/selectModel") }.compactMap { call in
+        call.body.flatMap { try? JSONValue.parse($0) }?.path("payload.args.request")
+      }
+    }
   }
 
   private func waitUntil(timeout: TimeInterval = 5, _ condition: () async -> Bool) async throws {
@@ -213,6 +264,74 @@ final class WeChatChannelServiceTests: XCTestCase {
       try await Task.sleep(for: .milliseconds(20))
     }
     XCTFail("condition not met within \(timeout)s")
+  }
+
+  /// Counts calls from any thread, for the "how many times did this happen" assertions.
+  final class Counter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+    func increment() { lock.lock(); count += 1; lock.unlock() }
+    var value: Int { lock.lock(); defer { lock.unlock() }; return count }
+  }
+
+  // MARK: - Provider rejections
+
+  /// The measured failure: the provider answered `ret -2` (a refused *request*), the channel
+  /// read it as an expired binding, the badge said "未绑定" over a perfectly live session, and
+  /// the poll stopped for good. A refusal is not an expiry.
+  func testRefusedPollKeepsPollingAndShowsWhatTheProviderSaid() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    provider.pollRejection = #"{"ret":-2,"errmsg":"参数错误：context_token 无效"}"#
+
+    await service.start()
+    try await waitUntil {
+      let status = await service.currentStatus()
+      return status.lastError?.contains("context_token 无效") == true
+    }
+
+    let refused = await service.currentStatus()
+    XCTAssertEqual(refused.phase, .degraded, "a refused request must not look like a dead binding")
+    XCTAssertEqual(refused.lastError?.contains("参数错误"), true)
+
+    // A second poll is the proof the loop survived; the first backoff is one second.
+    try await waitUntil { provider.pollCount >= 2 }
+    await service.stop()
+  }
+
+  /// The other half of the same distinction: `-14` really is an expired session, so polling stops
+  /// and the badge asks for a new scan instead of retrying forever.
+  func testExpiredSessionIsTerminalAndAsksForANewBind() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    provider.pollRejection = #"{"ret":-14,"errmsg":"session expired"}"#
+
+    await service.start()
+    try await waitUntil {
+      await service.currentStatus().phase == .needsLogin
+    }
+
+    let expired = await service.currentStatus()
+    XCTAssertEqual(expired.lastError?.contains("过期"), true)
+    XCTAssertEqual(provider.pollCount, 1, "an expired session is terminal, not retried")
+    await service.stop()
+  }
+
+  /// One transport for the channel's whole life.
+  ///
+  /// The factory used to run per operation; each run built a `URLSession` whose connections
+  /// outlived the call, until the process ran out of descriptors (`EMFILE`) and could no longer
+  /// write its own state file. Two commands must therefore build it exactly once.
+  func testHarnessTransportIsBuiltOnceForTheWholeChannel() async throws {
+    let creations = Counter()
+    let (service, provider, _, _) = try await makeService(
+      batches: [[inboundText("1", "/list")], [inboundText("2", "/list")]],
+      sessionList: #"{"items":[]}"#,
+      onHarnessTransportCreate: { creations.increment() }
+    )
+
+    await service.start()
+    try await waitUntil { provider.sentMessages.count >= 2 }
+    XCTAssertEqual(creations.value, 1, "the transport must be reused, not rebuilt per command")
+    await service.stop()
   }
 
   func testTriggerSubmitsOneBatchAndReplies() async throws {
@@ -1076,5 +1195,528 @@ final class WeChatChannelServiceTests: XCTestCase {
     let state = ChannelStateStore.standard(appRoot: root).loadState()
     XCTAssertNil(state.sessions["owner@im.wechat"])
     XCTAssertNil(state.adoptedSessions["owner@im.wechat"])
+  }
+
+  // MARK: - Information forwarding
+
+  /// Write a two-turn session log into the channel's own `$DSH_HOME`, so the forwarder's lookup goes
+  /// through the real path escaping rather than a shortcut that would pass even if it broke.
+  private func writeSessionLog(cwd: String, sessionID: String, turns: [(turn: Int, text: String)]) throws {
+    var lines = [#"{"type":"session","id":"\#(sessionID)"}"#]
+    for entry in turns {
+      lines.append(#"{"type":"turn/start","data":{"turn":\#(entry.turn)}}"#)
+      lines.append(
+        #"{"type":"assistant/message","data":{"turn":\#(entry.turn),"step":1,"message":{"id":"m\#(entry.turn)","role":"assistant","content":[{"type":"text","text":"\#(entry.text)"}]}}}"#
+      )
+      lines.append(#"{"type":"turn/end","data":{"turn":\#(entry.turn),"reason":{"kind":"completed"}}}"#)
+    }
+    let raw = Data((lines.joined(separator: "\n") + "\n").utf8)
+    let directory = try SessionPaths.sessionDirectory(
+      dshHome: root.appendingPathComponent("home"),
+      cwd: cwd,
+      sessionID: sessionID
+    )
+    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    try Zstd.compress(raw).write(to: directory.appendingPathComponent("session.v3.jsonl.zstd"))
+  }
+
+  /// The wording is the whole message on a phone, so it is pinned rather than eyeballed.
+  func testTurnHeadlineNamesTheSessionAndTheOutcome() {
+    func headline(_ kind: TurnEndKind, title: String? = "报告", turn: Int? = 3) -> String {
+      WeChatChannelService.turnHeadline(
+        TurnCompletion(sessionID: "session-x", sessionTitle: title, turn: turn, kind: kind)
+      )
+    }
+    XCTAssertEqual(headline(.completed), "✅ 报告 · 第 3 轮完成")
+    XCTAssertEqual(headline(.maxTokens), "⚠️ 报告 · 第 3 轮达到输出上限后停止")
+    XCTAssertEqual(headline(.blocked), "⛔️ 报告 · 第 3 轮被拒绝执行")
+    XCTAssertEqual(headline(.aborted), "🛑 报告 · 第 3 轮已中断")
+    // A missing title falls back to the id rather than producing an empty name, and a missing turn
+    // number to "本轮" rather than to "第 nil 轮".
+    XCTAssertEqual(headline(.completed, title: "   ", turn: nil), "✅ session-x · 本轮完成")
+  }
+
+  func testTurnHeadlineCarriesTheStructuredFailure() {
+    let completion = TurnCompletion(
+      sessionID: "session-x",
+      sessionTitle: "报告",
+      turn: 2,
+      kind: .error,
+      failureCode: "quota-exceeded",
+      failureMessage: "余额不足"
+    )
+    XCTAssertEqual(WeChatChannelService.turnHeadline(completion), "❌ 报告 · 第 2 轮失败（quota-exceeded：余额不足）")
+    // A failure with no detail still names the outcome; the parentheses are dropped rather than
+    // rendered empty.
+    let bare = TurnCompletion(sessionID: "session-x", turn: 2, kind: .error)
+    XCTAssertEqual(WeChatChannelService.turnHeadline(bare), "❌ session-x · 第 2 轮失败")
+  }
+
+  /// The shared switch is the only gate: with 手机远控 off, nothing about a finished turn goes out.
+  func testForwardingIsSilentUntilTheSwitchIsOn() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [(1, "桌面会话的答案")])
+
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 1, kind: .completed, cwd: workspace.path
+    ))
+
+    XCTAssertTrue(provider.sentMessages.isEmpty, "未开启手机远控时不应发出任何东西：\(provider.sentMessages)")
+    await service.stop()
+  }
+
+  /// With the switch on, one finished turn becomes two messages: what happened, and what it said.
+  func testForwardingSendsTheHeadlineAndTheTurnsAnswer() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    await service.setForwardsAllPrompts(true)
+    try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [
+      (1, "第一轮的答案"),
+      (2, "第二轮的答案"),
+    ])
+
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 2, kind: .completed, cwd: workspace.path
+    ))
+
+    let sent = provider.sentMessages
+    XCTAssertEqual(sent, ["✅ 报告 · 第 2 轮完成", "第二轮的答案"])
+    await service.stop()
+  }
+
+  /// The answer comes from the turn the ending names, not from whatever the log ends with.
+  func testForwardingReadsOnlyTheNamedTurn() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    await service.setForwardsAllPrompts(true)
+    try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [
+      (1, "旧的答案"),
+      (2, "新的答案"),
+    ])
+
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 1, kind: .completed, cwd: workspace.path
+    ))
+
+    XCTAssertEqual(provider.sentMessages, ["✅ 报告 · 第 1 轮完成", "旧的答案"])
+    await service.stop()
+  }
+
+  /// A log that cannot be found is ordinary — a workspace that moved, a path convention that changed
+  /// — and the headline still has to go out, because "it finished" is the part the user needs.
+  func testForwardingStillSendsTheHeadlineWithoutALoggableAnswer() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    await service.setForwardsAllPrompts(true)
+
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-nowhere", sessionTitle: "报告", turn: 1, kind: .completed, cwd: workspace.path
+    ))
+
+    XCTAssertEqual(provider.sentMessages, ["✅ 报告 · 第 1 轮完成"])
+    await service.stop()
+  }
+
+  /// A bound, not the whole answer: a long turn would otherwise arrive as a dozen phone messages,
+  /// which is the failure mode that gets a forwarding feature switched off.
+  func testForwardedReplyIsBoundedAndSaysSo() {
+    let short = String(repeating: "短", count: 10)
+    XCTAssertEqual(WeChatChannelService.bounded(short, limit: 600), short)
+
+    let marker = "\n…（内容较长，完整内容在 app 里）"
+    let long = String(repeating: "长", count: 700)
+    let bounded = WeChatChannelService.bounded(long, limit: 600)
+    XCTAssertTrue(bounded.hasPrefix(String(repeating: "长", count: 600)))
+    XCTAssertTrue(bounded.hasSuffix(marker), bounded)
+    XCTAssertEqual(bounded.count, 600 + marker.count)
+  }
+
+  /// Exactly at the limit is not "too long", so a reply that fits is not marked as clipped.
+  func testBoundedLeavesAReplyAtTheLimitAlone() {
+    let exact = String(repeating: "x", count: 600)
+    XCTAssertEqual(WeChatChannelService.bounded(exact, limit: 600), exact)
+  }
+
+  func testBoundedCollapsesWhitespaceOnlyText() {
+    XCTAssertEqual(WeChatChannelService.bounded("   \n  ", limit: 10), "")
+  }
+
+  /// An unowned session is a desk session and always forwarded.
+  func testUnownedSessionsAreForwarded() {
+    XCTAssertTrue(WeChatChannelService.shouldForward(
+      sessionID: "session-desk", owner: nil, adoptedSessionID: nil
+    ))
+  }
+
+  /// A session the channel created already delivers its answer into the chat, so forwarding it again
+  /// would send the same text twice.
+  func testCreatedSessionsAreNotForwardedTwice() {
+    XCTAssertFalse(WeChatChannelService.shouldForward(
+      sessionID: "session-test", owner: "owner@im.wechat", adoptedSessionID: nil
+    ))
+  }
+
+  /// A session the phone merely took over is different: the chat borrowed its approvals, and nothing
+  /// else pushes its output there. Skipping it would silently lose every result of a taken-over
+  /// session.
+  func testAdoptedSessionsAreStillForwarded() {
+    XCTAssertTrue(WeChatChannelService.shouldForward(
+      sessionID: "session-adopted", owner: "owner@im.wechat", adoptedSessionID: "session-adopted"
+    ))
+  }
+
+  /// Adopting a *different* session must not unlock forwarding for the created one.
+  func testAdoptionOfAnotherSessionDoesNotUnlockTheCreatedOne() {
+    XCTAssertFalse(WeChatChannelService.shouldForward(
+      sessionID: "session-test", owner: "owner@im.wechat", adoptedSessionID: "session-other"
+    ))
+  }
+
+  /// A session the chat already answers for must not be forwarded: the reply source delivers that
+  /// same text into the conversation it came from, and receiving it twice is the visible bug.
+  func testForwardingSkipsASessionTheChatAlreadyAnswersFor() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [[
+      inboundText("1", "看看这个报告"),
+      inboundText("2", "开始"),
+    ]])
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    await service.setForwardsAllPrompts(true)
+    let before = provider.sentMessages.count
+
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-test", sessionTitle: "微信会话", turn: 1, kind: .completed, cwd: workspace.path
+    ))
+
+    XCTAssertEqual(provider.sentMessages.count, before, "渠道自己的会话不应重复转发")
+    await service.stop()
+  }
+
+  // MARK: - Models and reasoning effort
+
+  /// Two models that both take `high`/`low`, which is the shape a phone actually sees.
+  private static let modelCatalogJSON = #"""
+  {"default":{"provider":"deepseek","model":"deepseek-chat"},"routableProviders":["deepseek"],
+   "groups":[{"id":"deepseek","name":"DeepSeek","models":[
+     {"id":"deepseek-chat","name":"DeepSeek Chat",
+      "reasoning":{"efforts":[{"id":"high","name":"高"},{"id":"low","name":"低"}],"defaultEffort":"high"}},
+     {"id":"deepseek-reasoner","name":"DeepSeek Reasoner",
+      "reasoning":{"efforts":[{"id":"high","name":"高"},{"id":"low","name":"低"}],"defaultEffort":"high"}}]}],
+   "failures":[]}
+  """#
+
+  /// One model with no reasoning block at all.
+  private static let noTierCatalogJSON = #"""
+  {"default":{"provider":"deepseek","model":"deepseek-chat"},"routableProviders":["deepseek"],
+   "groups":[{"id":"deepseek","name":"DeepSeek","models":[
+     {"id":"deepseek-chat","name":"DeepSeek Chat"}]}],
+   "failures":[]}
+  """#
+
+  /// A `session/list` answer whose one row is the session the channel creates, running on `model`.
+  ///
+  /// That projection is where `/model` reads what is in force, so a test controls the "current"
+  /// line by answering with the state it wants.
+  private func sessionListRunning(_ model: String, effort: String? = nil) -> String {
+    let selection = effort.map {
+      #"{"provider":"deepseek","model":"\#(model)","reasoningEffort":"\#($0)"}"#
+    } ?? #"{"provider":"deepseek","model":"\#(model)"}"#
+    return #"""
+    {"items":[{"sessionId":"session-test","cwd":"\#(workspace.path)","updatedAt":1700000000000,
+      "running":false,"projections":{"values":{"title":"微信 · owner",
+      "modelSelection":{"lastUsed":null,"next":\#(selection)}}}}]}
+    """#
+  }
+
+  private func choice(_ model: String) -> HarnessModelChoice {
+    HarnessModelChoice(provider: "deepseek", providerName: "DeepSeek", model: model, name: model)
+  }
+
+  func testModelCommandListsTheCatalogAndMarksTheCurrentModel() async throws {
+    let (service, provider, _, _) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/model")],
+      ],
+      sessionList: sessionListRunning("deepseek-chat", effort: "high"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { provider.sentMessages.contains { $0.contains("模型（共 2 个）") } }
+    await service.stop()
+
+    let text = try XCTUnwrap(provider.sentMessages.last { $0.contains("模型（共 2 个）") })
+    XCTAssertTrue(text.contains("当前：deepseek-chat · high"), text)
+    XCTAssertTrue(text.contains("1. ● DeepSeek Chat（deepseek-chat）"), text)
+    XCTAssertTrue(text.contains("2.   DeepSeek Reasoner（deepseek-reasoner）"), text)
+    XCTAssertTrue(text.contains("/model 2 high"), text)
+  }
+
+  /// The point of the feature: the switch reaches the bound session, with the effort, for the
+  /// *next* turn — not a note that something might have changed.
+  func testModelSwitchPinsModelAndEffortOnTheBoundSession() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/model 2 high")],
+      ],
+      sessionList: sessionListRunning("deepseek-chat"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { provider.sentMessages.contains { $0.contains("模型已切换") } }
+    await service.stop()
+
+    let request = try XCTUnwrap(harness.modelSelections.last)
+    XCTAssertEqual(request["sessionId"]?.stringValue, "session-test")
+    XCTAssertEqual(request["provider"]?.stringValue, "deepseek")
+    XCTAssertEqual(request["model"]?.stringValue, "deepseek-reasoner")
+    XCTAssertEqual(request["reasoningEffort"]?.stringValue, "high")
+
+    let text = try XCTUnwrap(provider.sentMessages.last { $0.contains("模型已切换") })
+    XCTAssertTrue(text.contains("deepseek-reasoner"), text)
+    XCTAssertTrue(text.contains("思考强度：high"), text)
+    XCTAssertTrue(text.contains("下一条消息就会用它"), text)
+  }
+
+  /// Naming no effort installs the model's *own* default, not the previous model's tier — the same
+  /// choice the desktop model menu makes.
+  func testModelSwitchWithoutAnEffortUsesThatModelsDefault() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/model 2")],
+      ],
+      sessionList: sessionListRunning("deepseek-chat", effort: "low"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { !harness.modelSelections.isEmpty }
+    await service.stop()
+
+    let request = try XCTUnwrap(harness.modelSelections.last)
+    XCTAssertEqual(request["model"]?.stringValue, "deepseek-reasoner")
+    XCTAssertEqual(request["reasoningEffort"]?.stringValue, "high")
+  }
+
+  /// `/model 2 high` is validated against that model's tiers: an effort it does not have is a
+  /// typo to report, not something to forward and let the host reject.
+  func testModelSwitchRejectsAnEffortTheModelDoesNotHave() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/model 2 特高")],
+      ],
+      sessionList: sessionListRunning("deepseek-chat"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { provider.sentMessages.contains { $0.contains("没有找到思考强度") } }
+    await service.stop()
+
+    XCTAssertTrue(harness.modelSelections.isEmpty, "a rejected effort must not reach the harness")
+    let text = try XCTUnwrap(provider.sentMessages.last { $0.contains("没有找到思考强度") })
+    XCTAssertTrue(text.contains("high、low"), text)
+  }
+
+  func testUnknownModelIsAnsweredWithoutTouchingTheHarness() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/model gpt-5")],
+      ],
+      sessionList: sessionListRunning("deepseek-chat"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { provider.sentMessages.contains { $0.contains("没有找到模型") } }
+    await service.stop()
+
+    XCTAssertTrue(harness.modelSelections.isEmpty)
+    XCTAssertTrue(provider.sentMessages.contains { $0.contains("没有找到模型「gpt-5」") })
+  }
+
+  /// `/effort` is the second half of the feature: change the tier without changing the model.
+  func testEffortCommandSwitchesTheTierOfTheCurrentModel() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/effort low")],
+      ],
+      sessionList: sessionListRunning("deepseek-reasoner", effort: "high"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { !harness.modelSelections.isEmpty }
+    await service.stop()
+
+    let request = try XCTUnwrap(harness.modelSelections.last)
+    XCTAssertEqual(request["model"]?.stringValue, "deepseek-reasoner", "the model must be left alone")
+    XCTAssertEqual(request["reasoningEffort"]?.stringValue, "low")
+  }
+
+  /// "默认" clears the tier: the request then carries no effort field at all, which is a different
+  /// request from naming one.
+  func testEffortDefaultClearsTheTier() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/effort 默认")],
+      ],
+      sessionList: sessionListRunning("deepseek-reasoner", effort: "high"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { !harness.modelSelections.isEmpty }
+    await service.stop()
+
+    let request = try XCTUnwrap(harness.modelSelections.last)
+    XCTAssertEqual(request["model"]?.stringValue, "deepseek-reasoner")
+    XCTAssertNil(request["reasoningEffort"], "no preference is an absent field, not an empty one")
+  }
+
+  /// The listing numbers the tiers, and a later `/effort 1` means the row the user read.
+  func testEffortListingNumbersTiersAndTheIndexResolvesAgainstIt() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/effort")],
+        [inboundText("4", "/effort 1")],
+      ],
+      sessionList: sessionListRunning("deepseek-reasoner", effort: "low"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains { $0.contains("的思考强度") } }
+    try await waitUntil { !harness.modelSelections.isEmpty }
+    await service.stop()
+
+    let listing = try XCTUnwrap(provider.sentMessages.first { $0.contains("的思考强度") })
+    XCTAssertTrue(listing.contains("当前：low"), listing)
+    XCTAssertTrue(listing.contains("1.   high（高）"), listing)
+    XCTAssertTrue(listing.contains("2. ● low（低）"), listing)
+    XCTAssertEqual(harness.modelSelections.last?["reasoningEffort"]?.stringValue, "high")
+  }
+
+  /// When the host does not project a selection, `/effort` must ask rather than guess: installing
+  /// an effort on the harness default would move a session the channel could not read.
+  func testEffortCommandAsksWhenTheCurrentModelIsUnknown() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/effort high")],
+      ],
+      sessionList: #"{"items":[{"sessionId":"session-test","cwd":"/tmp/x","updatedAt":1700000000000,"running":false}]}"#,
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { provider.sentMessages.contains { $0.contains("还不知道当前用的是哪个模型") } }
+    await service.stop()
+
+    XCTAssertTrue(harness.modelSelections.isEmpty, "an unknown model must not be retargeted by guess")
+  }
+
+  func testEffortCommandExplainsAModelWithoutTiers() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "看看这个报告"), inboundText("2", "开始")],
+        [inboundText("3", "/effort high")],
+      ],
+      sessionList: sessionListRunning("deepseek-chat"),
+      modelCatalog: Self.noTierCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    try await waitUntil { provider.sentMessages.contains { $0.contains("不支持调思考强度") } }
+    await service.stop()
+
+    XCTAssertTrue(harness.modelSelections.isEmpty)
+  }
+
+  /// A model chosen before the first message has no session to live on, so the channel remembers
+  /// it — and the session it creates next starts on it, from its very first turn.
+  func testModelChosenBeforeAnySessionAppliesToTheNextOne() async throws {
+    let (service, provider, _, harness) = try await makeService(
+      batches: [
+        [inboundText("1", "/model 2")],
+        [inboundText("2", "看看这个报告"), inboundText("3", "开始")],
+      ],
+      sessionList: sessionListRunning("deepseek-chat"),
+      modelCatalog: Self.modelCatalogJSON
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains { $0.contains("模型已选好") } }
+    try await waitUntil { !harness.modelSelections.isEmpty }
+    await service.stop()
+
+    let confirmation = try XCTUnwrap(provider.sentMessages.first { $0.contains("模型已选好") })
+    XCTAssertTrue(confirmation.contains("还没有绑定会话"), confirmation)
+    XCTAssertTrue(confirmation.contains("下一条消息开的新会话上生效"), confirmation)
+
+    let request = try XCTUnwrap(harness.modelSelections.last)
+    XCTAssertEqual(request["sessionId"]?.stringValue, "session-test")
+    XCTAssertEqual(request["model"]?.stringValue, "deepseek-reasoner")
+    XCTAssertEqual(request["reasoningEffort"]?.stringValue, "high")
+  }
+
+  /// A harness too old to have the endpoint answers 404, which is a problem the user can fix —
+  /// so it gets its own sentence instead of a bare "HTTP 404".
+  func testHarnessWithoutTheModelCatalogSaysWhichEndpointIsMissing() async throws {
+    let (service, provider, _, _) = try await makeService(
+      batches: [[inboundText("1", "/model")]],
+      harnessResponders: { call in
+        if call.method == "GET" {
+          return HarnessAPIResponse(status: 303, headers: ["set-cookie": "dsh-auth-k=v; Path=/"], body: Data())
+        }
+        if call.path.hasSuffix("session/modelCatalog") {
+          return HarnessAPIResponse(status: 404, body: Data("not found".utf8))
+        }
+        return HarnessAPIResponse(status: 200, body: Data(
+          #"{"type":"server-response","rpcId":"x","result":{"ok":false,"error":{"code":"gateway/arguments-invalid","message":"args","details":{}}}}"#.utf8
+        ))
+      }
+    )
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains { $0.contains("没有模型目录") } }
+    await service.stop()
+
+    let text = try XCTUnwrap(provider.sentMessages.last { $0.contains("没有模型目录") })
+    XCTAssertTrue(text.contains("session/modelCatalog"), text)
+  }
+
+  /// An index is only meaningful against the listing it came from, so the row the user read wins
+  /// over a fresh catalog read that may have reordered or regrown underneath them.
+  func testModelIndexResolvesAgainstTheListingTheUserRead() {
+    let catalog = HarnessModelCatalog(choices: [choice("a"), choice("b"), choice("c")])
+    let shown = [choice("c"), choice("a")]
+
+    XCTAssertEqual(WeChatChannelService.resolveModel(target: "1", shown: shown, catalog: catalog)?.model, "c")
+    XCTAssertEqual(WeChatChannelService.resolveModel(target: "2", shown: shown, catalog: catalog)?.model, "a")
+    // Beyond the shown listing the fresh catalog still answers, in the same order.
+    XCTAssertEqual(WeChatChannelService.resolveModel(target: "3", shown: shown, catalog: catalog)?.model, "c")
+    XCTAssertEqual(WeChatChannelService.resolveModel(target: "b", shown: shown, catalog: catalog)?.model, "b")
+    XCTAssertNil(WeChatChannelService.resolveModel(target: "9", shown: shown, catalog: catalog))
+    XCTAssertNil(WeChatChannelService.resolveModel(target: "zzz", shown: shown, catalog: catalog))
+  }
+
+  func testEffortResolutionSeparatesUnknownFromProviderDefault() {
+    let model = HarnessModelChoice(
+      provider: "deepseek", providerName: "DeepSeek", model: "m", name: "M",
+      efforts: [HarnessModelEffort(id: "high", name: "高")],
+      defaultEffort: "high"
+    )
+    XCTAssertEqual(WeChatChannelService.resolveEffort("高", choice: model), .tier("high"))
+    XCTAssertEqual(WeChatChannelService.resolveEffort("HIGH", choice: model), .tier("high"))
+    XCTAssertEqual(WeChatChannelService.resolveEffort("默认", choice: model), .providerDefault)
+    XCTAssertEqual(WeChatChannelService.resolveEffort("特高", choice: model), .unknown)
   }
 }

@@ -329,7 +329,18 @@ public actor ILinkClient {
       throw ILinkError(.invalidResponse, "微信服务返回了无法解析的响应")
     }
     if let rejection = ILinkResponse.rejectionCode(value) {
-      throw ILinkError(.providerRejected, "微信服务拒绝了这次请求（ret \(rejection)）")
+      // The body stays part of the error: `ret` alone is what made "参数错误" and "会话过期"
+      // indistinguishable on screen, and the provider's own `errmsg` is the only sentence that
+      // says which parameter it disliked.
+      let detail = ILinkResponse.errorDetail(value)
+      switch ILinkRejection(rawCode: rejection) {
+      case .sessionExpired:
+        throw ILinkError(.sessionExpired, "微信会话已过期，需要重新扫码绑定（-14\(detail)）")
+      case .invalidRequest:
+        throw ILinkError(.invalidRequest, "微信服务拒绝了这次请求：参数错误（ret \(rejection)\(detail)）")
+      case .other(let raw):
+        throw ILinkError(.providerRejected, "微信服务拒绝了这次请求（ret \(raw)\(detail)）")
+      }
     }
     return value
   }

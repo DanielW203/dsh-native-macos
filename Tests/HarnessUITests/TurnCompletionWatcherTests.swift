@@ -69,6 +69,12 @@ private actor CompletionRecorder {
   func record(_ completion: TurnCompletion) { completions.append(completion) }
 }
 
+/// Counts how often a session's stream was opened.
+private actor OpenCounter {
+  private(set) var count = 0
+  func record() { count += 1 }
+}
+
 /// A thread-safe place for the factory to hand each stub to the test.
 private final class FollowerRegistry: @unchecked Sendable {
   private let lock = NSLock()
@@ -119,11 +125,11 @@ final class TurnCompletionWatcherTests: XCTestCase {
     )
   }
 
-  private func event(_ type: String, turn: Int? = nil, reason: String? = nil) -> SessionFollowFrame {
+  private func event(_ type: String, turn: Int? = nil, seq: Int? = nil, reason: String? = nil) -> SessionFollowFrame {
     var data: [String: JSONValue] = [:]
     if let turn { data["turn"] = .number(Double(turn)) }
     if let reason { data["reason"] = .object(["kind": .string(reason)]) }
-    return .event(type: type, seq: nil, turn: turn, data: .object(data))
+    return .event(type: type, seq: seq, turn: turn, data: .object(data))
   }
 
   /// Wait until a condition holds, failing the test rather than hanging.
@@ -148,6 +154,22 @@ final class TurnCompletionWatcherTests: XCTestCase {
     await wait("\(count) completion(s)") { await self.recorder.completions.count >= count }
   }
 
+  /// End a session's stream and wait for the *replacement* one.
+  ///
+  /// Waiting on `state == .live` is not enough: the state is still `.live` from the stream that just
+  /// ended, so a frame emitted at that moment goes to a closed stub. The factory hands out a fresh
+  /// stub per open, so identity is the reliable signal.
+  @discardableResult
+  private func reconnect(_ sessionID: String) async -> StubSessionFollower? {
+    let previous = registry.stub(for: sessionID)
+    previous?.finish()
+    await wait("a new subscription for \(sessionID)") {
+      guard let current = self.registry.stub(for: sessionID) else { return false }
+      return current !== previous
+    }
+    return registry.stub(for: sessionID)
+  }
+
   // MARK: - The history rule
 
   /// The boundary rule: frames that arrive **before** the opening snapshot are not live and must
@@ -170,7 +192,7 @@ final class TurnCompletionWatcherTests: XCTestCase {
     XCTAssertTrue(reported.isEmpty, "frames before the snapshot are not live: \(reported)")
 
     // The boundary, then one live ending.
-    stub?.emit(.snapshot(cursor: 100))
+    stub?.emit(.snapshot(cursor: 100, records: []))
     stub?.emit(event("turn/end", turn: 3, reason: "completed"))
     await waitForCompletions(1)
 
@@ -185,7 +207,7 @@ final class TurnCompletionWatcherTests: XCTestCase {
     await waitUntilLive(watcher, sessionID: "s1")
 
     let stub = registry.stub(for: "s1")
-    stub?.emit(.snapshot(cursor: 10))
+    stub?.emit(.snapshot(cursor: 10, records: []))
     stub?.emit(event("turn/end", turn: 1, reason: "completed"))
 
     await waitForCompletions(1)
@@ -198,8 +220,141 @@ final class TurnCompletionWatcherTests: XCTestCase {
     await watcher.stop()
   }
 
-  // MARK: - Which endings reach the user
+  // MARK: - Catching up across a reconnect
 
+  /// The failure this watcher used to have, reproduced: a harness closes a subscription taken
+  /// mid-turn almost immediately, and the ending lands in the *next* snapshot rather than on a live
+  /// frame. Treating that page as pure history meant a session in use never reported anything at all.
+  func testAReconnectCatchesUpOnEndingsFromTheOpeningPage() async {
+    let watcher = makeWatcher()
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+
+    // First subscription: the baseline, then one ending that arrived live.
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 10, records: []))
+    registry.stub(for: "s1")?.emit(event("turn/end", turn: 1, seq: 11, reason: "completed"))
+    await waitForCompletions(1)
+
+    // The stream dies mid-turn — what a live harness does — and the ending it missed is now only in
+    // the page the re-subscription opens with.
+    let reconnected = await reconnect("s1")
+    reconnected?.emit(.snapshot(cursor: 20, records: [
+      SessionFollowRecord(type: "turn/end", seq: 15, turn: 2, data: .object([
+        "turn": .number(2), "reason": .object(["kind": .string("completed")]),
+      ])),
+      SessionFollowRecord(type: "turn/start", seq: 16, turn: 3, data: .object(["turn": .number(3)])),
+    ]))
+
+    await waitForCompletions(2)
+    let reported = await recorder.completions
+    XCTAssertEqual(reported.map(\.turn), [1, 2], "the missed ending is reported exactly once: \(reported)")
+    await watcher.stop()
+  }
+
+  /// The other half of that rule: the *first* snapshot is still a baseline. Nothing in it may be
+  /// announced, or every app launch would replay the turns the user already saw.
+  func testTheFirstSnapshotIsOnlyABaseline() async {
+    let watcher = makeWatcher()
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 30, records: [
+      SessionFollowRecord(type: "turn/end", seq: 29, turn: 7, data: .object([
+        "turn": .number(7), "reason": .object(["kind": .string("completed")]),
+      ])),
+    ]))
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    let reported = await recorder.completions
+    XCTAssertTrue(reported.isEmpty, "history is never replayed: \(reported)")
+
+    // …and an ending that arrives live after it still is.
+    registry.stub(for: "s1")?.emit(event("turn/end", turn: 8, seq: 31, reason: "completed"))
+    await waitForCompletions(1)
+    let turns = await recorder.completions.map(\.turn)
+    XCTAssertEqual(turns, [8])
+    await watcher.stop()
+  }
+
+  /// A page whose records were already delivered live must not be announced again — a reconnect can
+  /// re-send events the previous stream had in flight.
+  func testCatchUpDoesNotRepeatWhatWasAlreadyReported() async {
+    let watcher = makeWatcher()
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 10, records: []))
+    registry.stub(for: "s1")?.emit(event("turn/end", turn: 1, seq: 11, reason: "completed"))
+    await waitForCompletions(1)
+
+    let reconnected = await reconnect("s1")
+    // The same ending, this time inside the page.
+    reconnected?.emit(.snapshot(cursor: 12, records: [
+      SessionFollowRecord(type: "turn/end", seq: 11, turn: 1, data: .object([
+        "turn": .number(1), "reason": .object(["kind": .string("completed")]),
+      ])),
+      SessionFollowRecord(type: "turn/end", seq: 12, turn: 2, data: .object([
+        "turn": .number(2), "reason": .object(["kind": .string("completed")]),
+      ])),
+    ]))
+    await waitForCompletions(2)
+
+    let reported = await recorder.completions
+    XCTAssertEqual(reported.map(\.turn), [1, 2], "seq 11 was already announced: \(reported)")
+    await watcher.stop()
+  }
+
+  /// A session that leaves the target set and comes back gets a fresh baseline: replaying everything
+  /// that happened while it was out would be a burst of stale notifications.
+  func testASessionThatLeavesAndReturnsReBaselines() async {
+    let watcher = makeWatcher(sessionLimit: 1)
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 10, records: []))
+    registry.stub(for: "s1")?.emit(event("turn/end", turn: 1, seq: 11, reason: "completed"))
+    await waitForCompletions(1)
+
+    // Culled by a newer session, then named again.
+    await watcher.setTargets([.init(sessionID: "s2")], includeSubagents: false)
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    await wait("s1 to be followed again") { await watcher.state(of: "s1") == .live }
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 40, records: [
+      SessionFollowRecord(type: "turn/end", seq: 39, turn: 9, data: .object([
+        "turn": .number(9), "reason": .object(["kind": .string("completed")]),
+      ])),
+    ]))
+    try? await Task.sleep(nanoseconds: 80_000_000)
+
+    let reported = await recorder.completions
+    XCTAssertEqual(reported.map(\.turn), [1], "only the turn reported while it was followed: \(reported)")
+    await watcher.stop()
+  }
+
+  /// A stream that carries nothing and ends immediately must back off instead of hammering the
+  /// harness: measured in production, one session re-snapshotted ~1.9 MB every 12 seconds for hours.
+  func testAStreamThatCarriesNothingBacksOff() async {
+    let opens = OpenCounter()
+    let watcher = TurnCompletionWatcher(
+      retryBase: 0.05,
+      retryCeiling: 0.5,
+      followerFactory: { _ in
+        await opens.record()
+        let stub = StubSessionFollower()
+        stub.finish()  // opens, snapshots nothing, ends — every time
+        return stub
+      },
+      onCompletion: { _ in }
+    )
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    try? await Task.sleep(nanoseconds: 300_000_000)
+
+    let count = await opens.count
+    // Without the backoff this is one open per retryBase (≈6 in 300 ms); with it, 0 / +100 / +200 ms.
+    XCTAssertLessThanOrEqual(count, 4, "an empty, instantly-ending stream must back off, not spin (\(count) opens)")
+    await watcher.stop()
+  }
+
+  // MARK: - Which endings reach the user
   /// One table, because this is a product decision rather than an implementation detail.
   func testOnlyEndingsWorthAnnouncingAreReported() async {
     let cases: [(reason: String, expected: [TurnEndKind])] = [
@@ -228,7 +383,7 @@ final class TurnCompletionWatcherTests: XCTestCase {
       await wait("\(reason) to go live") { await watcher.state(of: "s1") == .live }
 
       let stub = registry.stub(for: "s1")
-      stub?.emit(.snapshot(cursor: 0))
+      stub?.emit(.snapshot(cursor: 0, records: []))
       stub?.emit(event("turn/end", turn: 1, reason: reason))
       // Wait for the frame to be processed by waiting for a following, never-reported frame.
       stub?.emit(event("turn/start", turn: 2))
@@ -245,7 +400,7 @@ final class TurnCompletionWatcherTests: XCTestCase {
     await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
     await waitUntilLive(watcher, sessionID: "s1")
 
-    registry.stub(for: "s1")?.emit(.snapshot(cursor: 0))
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 0, records: []))
     registry.stub(for: "s1")?.emit(.event(
       type: "turn/end",
       seq: nil,
@@ -276,7 +431,7 @@ final class TurnCompletionWatcherTests: XCTestCase {
     await waitUntilLive(watcher, sessionID: "s1")
 
     let stub = registry.stub(for: "s1")
-    stub?.emit(.snapshot(cursor: 0))
+    stub?.emit(.snapshot(cursor: 0, records: []))
     stub?.emit(event("tool/call", turn: 1))
     stub?.emit(event("assistant/message", turn: 1))
     stub?.emit(.assistantStream)
@@ -355,7 +510,7 @@ final class TurnCompletionWatcherTests: XCTestCase {
     try? await Task.sleep(nanoseconds: 30_000_000)
 
     XCTAssertFalse(stub?.closed ?? true, "an already-followed session must keep its stream")
-    stub?.emit(.snapshot(cursor: 0))
+    stub?.emit(.snapshot(cursor: 0, records: []))
     stub?.emit(event("turn/end", turn: 1, reason: "completed"))
     await waitForCompletions(1)
     await watcher.stop()

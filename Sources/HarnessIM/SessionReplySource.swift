@@ -41,7 +41,10 @@ public enum SessionReplyExtractor {
     for event in events[start...] {
       if let message = event.assistantMessage {
         turn = message.turn ?? turn
-        let rendered = message.content.compactMap(\.textValue).joined()
+        // `message.text` is the plain text blocks only. Joining `textValue` instead would fold the
+        // model's reasoning in — the harness writes that block first, so the reply that reached the
+        // phone would be its thinking.
+        let rendered = message.text
         if !rendered.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
           text = rendered
         }
@@ -58,6 +61,56 @@ public enum SessionReplyExtractor {
 
   static func messageTurn(_ event: SessionEvent) -> Int? {
     event.data.path("turn")?.intValue
+  }
+
+  /// What one turn answered, read out of a session's own log.
+  ///
+  /// **Bounded to a single turn**, which is the whole difficulty: a session log is append-only and
+  /// holds every turn that ever ran, so a scan that merely collects assistant text would forward a
+  /// conversation rather than an answer. The window runs from the turn's own `turn/end` back to the
+  /// nearest boundary before it.
+  ///
+  /// The **last** non-empty message in that window, not every message: a turn narrates as it goes
+  /// and then answers, and pushing three partial paragraphs to a phone for one result is worse than
+  /// pushing none. That matches `reply(in:requestId:)`, which settles on the last one for the same
+  /// reason.
+  ///
+  /// - Parameter turn: the turn to read, or `nil` for "the newest ending in this log" — what a
+  ///   caller that only holds a session id can ask for.
+  public static func turnReply(in events: [SessionEvent], turn: Int?) -> String? {
+    let end: Int
+    if let turn {
+      // A turn that never ended has no answer to forward, and guessing "the newest one" here would
+      // attribute an older turn's text to the turn that just failed to end.
+      guard let index = events.lastIndex(where: { $0.kind == .turnEnd && messageTurn($0) == turn }) else {
+        return nil
+      }
+      end = index
+    } else {
+      end = events.count - 1
+    }
+    guard end >= 0 else { return nil }
+
+    var start = 0
+    var index = end - 1
+    while index >= 0 {
+      let kind = events[index].kind
+      if kind == .turnStart || kind == .turnEnd {
+        start = index + 1
+        break
+      }
+      index -= 1
+    }
+
+    var found: String?
+    for event in events[start...end] {
+      guard let message = event.assistantMessage else { continue }
+      // Plain text only, for the same reason as `reply(in:requestId:)`: reasoning is not the answer,
+      // and a length cap applied to "reasoning + answer" would spend itself on the reasoning.
+      let rendered = message.text
+      if !rendered.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { found = rendered }
+    }
+    return found
   }
 }
 

@@ -225,4 +225,75 @@ final class TurnNotificationSettingsTests: XCTestCase {
     XCTAssertEqual(model.turnWatch, .idle)
     XCTAssertNil(model.turnWatch.label)
   }
+
+  // MARK: - Forwarding to the phone
+
+  /// Records what the phone was told, so the forwarding decision is assertable without a channel,
+  /// a bot, or a socket.
+  private actor RecordingPhoneForwarder: PhoneInfoForwarding {
+    private(set) var forwarded: [TurnCompletion] = []
+    func forwardTurn(_ completion: TurnCompletion) async {
+      forwarded.append(completion)
+    }
+  }
+
+  /// The same ending that produces a notification is offered to the phone.
+  func testTurnEndingsAreForwardedToThePhone() async {
+    let (model, _) = makeModel()
+    let forwarder = RecordingPhoneForwarder()
+    model.phoneForwarder = forwarder
+
+    await model.deliver(completion(kind: .completed, turn: 1))
+    await model.deliver(completion(kind: .error, turn: 2))
+
+    let forwarded = await forwarder.forwarded
+    XCTAssertEqual(forwarded.map(\.kind), [.completed, .error])
+    XCTAssertEqual(forwarded.map(\.turn), [1, 2])
+    // The session's working directory rides along, because the forwarder locates the log by it.
+    XCTAssertEqual(forwarded.first?.sessionID, "session-1")
+  }
+
+  /// Forwarding is the phone's own outlet. Silencing the Mac's popups is a statement about this Mac,
+  /// and a user who did that while leaving 手机远控 on is asking for exactly this split — which is
+  /// also why the phone's switch, not these, is what turns it off.
+  func testForwardingSurvivesTheLocalNotificationSwitches() async {
+    let (model, presenter) = makeModel()
+    let forwarder = RecordingPhoneForwarder()
+    model.phoneForwarder = forwarder
+    model.notificationsEnabled = false
+    model.turnCompletionEnabled = false
+    model.turnFailureEnabled = false
+
+    await model.deliver(completion(kind: .completed, turn: 1))
+    await model.deliver(completion(kind: .error, turn: 2))
+
+    XCTAssertTrue(presenter.turnCompletions.isEmpty, "the local path is off")
+    let forwarded = await forwarder.forwarded
+    XCTAssertEqual(forwarded.count, 2, "the phone path is not")
+  }
+
+  /// The one local preference that does gate it. Subagent chatter is worse on a phone than in a
+  /// notification centre, and the existing switch is already the place that decides it.
+  func testSubagentForwardingFollowsTheSubagentSwitch() async {
+    let (model, _) = makeModel()
+    let forwarder = RecordingPhoneForwarder()
+    model.phoneForwarder = forwarder
+
+    await model.deliver(completion(kind: .completed, isSubagent: true))
+    var forwarded = await forwarder.forwarded
+    XCTAssertTrue(forwarded.isEmpty, "subagent chatter is off by default")
+
+    model.subagentNotificationsEnabled = true
+    await model.deliver(completion(kind: .completed, isSubagent: true))
+    forwarded = await forwarder.forwarded
+    XCTAssertEqual(forwarded.count, 1)
+  }
+
+  /// A build with no channel — and every test above before the forwarder is set — simply has no
+  /// phone path. Absence must not be an error, and must not change the local one.
+  func testWithoutAForwarderTheNotificationPathIsUnchanged() async {
+    let (model, presenter) = makeModel()
+    await model.deliver(completion(kind: .completed, turn: 1))
+    XCTAssertEqual(presenter.turnCompletions.map(\.kind), [.completed])
+  }
 }

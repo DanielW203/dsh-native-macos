@@ -20,14 +20,45 @@ final class TurnCompletionTests: XCTestCase {
 
   func testSnapshotFrameCarriesTheCursor() throws {
     let frame = SessionFollowFrame.parse(try json(#"{"type":"snapshot","cursor":128,"hasMore":false}"#))
-    XCTAssertEqual(frame, .snapshot(cursor: 128))
+    XCTAssertEqual(frame, .snapshot(cursor: 128, records: []))
   }
 
   func testSnapshotWithoutACursorStillOpensTheStream() throws {
     // The cursor is the only field this client reads, and a stream that opened is still usable.
     // Failing the frame here would drop the boundary that separates history from live events.
     let frame = SessionFollowFrame.parse(try json(#"{"type":"snapshot","hasMore":true}"#))
-    XCTAssertEqual(frame, .snapshot(cursor: 0))
+    XCTAssertEqual(frame, .snapshot(cursor: 0, records: []))
+  }
+
+  /// The page a snapshot opens with is the gap a reconnecting reader has to catch up on, so its
+  /// records are decoded through the same envelope the live frames use.
+  func testSnapshotDecodesItsHistoryPage() throws {
+    let frame = SessionFollowFrame.parse(try json("""
+    {"type":"snapshot","cursor":50,"records":[
+      {"type":"event","event":{"seq":48,"time":1,"type":"turn/end","data":{"turn":3,"reason":{"kind":"completed"}}}},
+      {"type":"event","event":{"seq":49,"time":1,"type":"turn/start","data":{"turn":4}}}
+    ]}
+    """))
+    guard case .snapshot(let cursor, let records) = frame else {
+      return XCTFail("expected a snapshot frame, got \(String(describing: frame))")
+    }
+    XCTAssertEqual(cursor, 50)
+    XCTAssertEqual(records.map(\.seq), [48, 49])
+    XCTAssertEqual(records.map(\.type), ["turn/end", "turn/start"])
+    XCTAssertEqual(records[0].turn, 3)
+
+    // A record with no sequence number cannot be placed on the log; one that is not an event
+    // envelope is not a record at all.
+    let unnumbered = SessionFollowFrame.parse(
+      try json(#"{"type":"snapshot","records":[{"type":"event","event":{"type":"turn/end"}}]}"#)
+    )
+    guard case .snapshot(_, let partial) = unnumbered else { return XCTFail("expected a snapshot") }
+    XCTAssertEqual(partial.count, 1)
+    XCTAssertNil(partial[0].seq)
+
+    let junk = SessionFollowFrame.parse(try json(#"{"type":"snapshot","records":[{"nope":true}]}"#))
+    guard case .snapshot(_, let empty) = junk else { return XCTFail("expected a snapshot") }
+    XCTAssertTrue(empty.isEmpty)
   }
 
   func testEventFrameCarriesTypeSeqAndTurn() throws {

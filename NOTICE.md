@@ -21,6 +21,19 @@
 |---|---|---|
 | `Vendor/zstd/**` | Zstandard (facebook/zstd) | BSD-3-Clause OR GPL-2.0（本项目按 BSD-3-Clause 使用）；见 `Vendor/zstd/LICENSE`、`Vendor/zstd/COPYING` |
 
+## 派生规范文件（Derived specification files）
+
+下列文件包含派生自官方 DeepSeek Harness 的内容，按同样的 MIT 条款再分发，并在此声明归属：
+
+- `Spec/**` —— 从官方运行时提取的规范 fixture
+- `Sources/HarnessCore/Tools/Generated/ToolSchemas.swift` —— 由官方工具目录生成
+
+The following files contain material derived from the official DeepSeek Harness
+(`@deepseek-ai/dsh`, MIT License, Copyright (c) 2026 DeepSeek) and are redistributed
+here under the same MIT terms with this attribution. (This attribution lives here rather
+than in `LICENSE`: `LICENSE` must stay verbatim MIT so that GitHub's license detection
+reports MIT instead of NOASSERTION.)
+
 ## 素材与品牌
 
 - `Apps/DSHNative/Resources/Assets.xcassets/AppIcon.appiconset/` 内的应用图标**包含 DeepSeek

@@ -2,6 +2,7 @@ import AppKit
 import CoreImage
 import Foundation
 import HarnessIM
+import HarnessKit
 import SwiftUI
 
 /// The channel window's view model.
@@ -221,12 +222,14 @@ public final class WeChatChannelModel: ObservableObject {
     guard isBound else {
       return "手机远控：需要先绑定微信机器人（Harness 菜单 → WeChat Channel）"
     }
-    let commands = "会话命令（/list 列表、/use 接管、/history 历史、/say 续聊、/stop 中断）随时可用，发 /help 看全部。"
+    let commands = "会话命令（/list 列表、/use 接管、/history 历史、/say 续聊、/stop 中断、/model 换模型、/effort 调思考强度）随时可用，发 /help 看全部。"
     if forwardsAllPrompts {
       // The switch is intent; delivery needs the bot online. Claiming "已开启" while nothing
       // can go out would leave the user waiting on a request that was never sent.
       var text = """
-      手机远控已开启：任何会话需要你批准或回答时都会发到微信，直接回「批准」/「拒绝」，或按提示 /answer 作答。桌面弹窗仍然可用，先答的先生效。
+      手机远控已开启，两件事同时生效：
+      · 审批与提问：任何会话需要你批准或回答时都会发到微信，直接回「批准」/「拒绝」，或按提示 /answer 作答。桌面弹窗仍然可用，先答的先生效。
+      · 信息转发：桌面会话每轮结束时把结果发过来（✅ 完成 / ⚠️ 上限 / ❌ 失败），并把这一轮回复的正文一起转发；来自微信的会话不重复转发。
       \(commands)
       点击关闭。
       """
@@ -234,9 +237,9 @@ public final class WeChatChannelModel: ObservableObject {
       return text
     }
     return """
-    手机远控已关闭：桌面会话的审批与提问只在 app 里回答；来自微信的会话仍会照旧转发到微信。
+    手机远控已关闭：桌面会话的审批、提问与轮次信息都留在 app 里；来自微信的会话仍会照旧在微信里收发。
     \(commands)
-    点击开启后，所有会话的审批与提问都会推到手机。
+    点击开启后，审批与提问会推到手机，桌面会话每轮的结果与回复也会转发过来。
     """
   }
 
@@ -301,13 +304,16 @@ public struct WeChatChannelWindow: View {
         if model.isBound {
           // The same switch the window toolbar carries: this is the settings home for the
           // channel, and a state only one of the two surfaces could show would drift.
-          Toggle("手机远控推送（所有会话的审批与提问都发到微信）", isOn: Binding(
+          Toggle("手机远控（审批与提问推送到微信，并转发桌面会话的轮次结果与回复）", isOn: Binding(
             get: { model.forwardsAllPrompts },
             set: { model.setForwardsAllPrompts($0) }
           ))
           .toggleStyle(.switch)
           .help(model.phoneControlHelp)
-          Text("会话远控命令（/list、/use、/history、/say、/stop、/answer）不需要这个开关，在微信里直接发即可。")
+          Text("会话远控命令（/list、/use、/history、/say、/stop、/answer、/model、/effort）不需要这个开关，在微信里直接发即可。")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+          Text("信息转发由这个开关单独决定，不受本机「通知」里的细分开关影响；只有子代理会话沿用「子代理通知」设置。")
             .font(.caption)
             .foregroundStyle(.secondary)
           if model.pendingPromptCount > 0 {
@@ -519,9 +525,22 @@ public struct WeChatChannelWindow: View {
   }
 }
 
+// MARK: - Information forwarding
+
+extension WeChatChannelModel: PhoneInfoForwarding {
+  /// Forward one ended turn to the phone.
+  ///
+  /// A pass-through on purpose. The decision to send — is the switch on, is there a bound owner to
+  /// send to, is this a session the chat already answers for — lives in the service, which is the
+  /// only object that knows all three. Duplicating any of it here would give the same question two
+  /// answers, and the one in the model would be the one that cannot see the credential.
+  public func forwardTurn(_ completion: TurnCompletion) async {
+    await service.forwardTurnInfo(completion)
+  }
+}
+
 /// Renders the provider's QR content.
-enum QRCodeImage {
-  static func image(for content: String) -> NSImage? {
+enum QRCodeImage {  static func image(for content: String) -> NSImage? {
     guard !content.isEmpty, let data = content.data(using: .utf8) else { return nil }
     let filter = CIFilter(name: "CIQRCodeGenerator")
     filter?.setValue(data, forKey: "inputMessage")

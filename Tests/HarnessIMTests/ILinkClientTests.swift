@@ -154,6 +154,35 @@ final class ILinkClientTests: XCTestCase {
     }
   }
 
+  /// An expired session and a refused request are different failures: one needs a new QR scan,
+  /// the other needs the caller to fix what it sent. Collapsing them is what made a wrong
+  /// parameter look like a dead binding.
+  func testExpiredSessionAndRefusedRequestAreDifferentFailures() async throws {
+    let expired = ILinkClient(transport: StubILinkTransport { _ in json(#"{"ret":0,"errcode":-14}"#) })
+    do {
+      _ = try await expired.getUpdates(token: "tok", buffer: "b")
+      XCTFail("expected an expired session")
+    } catch {
+      let error = error as? ILinkError
+      XCTAssertEqual(error?.code, .sessionExpired)
+      XCTAssertTrue(try XCTUnwrap(error?.message).contains("重新扫码"))
+    }
+
+    let refused = ILinkClient(transport: StubILinkTransport { _ in
+      json(#"{"ret":-2,"errmsg":"context_token 无效"}"#)
+    })
+    do {
+      _ = try await refused.sendText(token: "tok", toUserID: "owner@im.wechat", text: "hi")
+      XCTFail("expected a refused request")
+    } catch {
+      let error = error as? ILinkError
+      XCTAssertEqual(error?.code, .invalidRequest)
+      // The provider's own words survive into the message; that is what makes it diagnosable.
+      XCTAssertTrue(try XCTUnwrap(error?.message).contains("参数错误"))
+      XCTAssertTrue(try XCTUnwrap(error?.message).contains("context_token 无效"))
+    }
+  }
+
   func testSendTextBuildsTheProviderMessage() async throws {
     let transport = StubILinkTransport { _ in json(#"{"ret":0}"#) }
     let client = ILinkClient(transport: transport)

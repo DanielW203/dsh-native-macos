@@ -26,6 +26,11 @@ public enum ChatCommand: Sendable, Equatable {
   case workspaceList
   /// Move the channel to another workspace: a list index, an id, a title, or a folder.
   case workspace(String)
+  /// Which models this harness can route to. `nil` target is the listing; the effort is the
+  /// optional second half of `/model 2 high`.
+  case model(String?, effort: String?)
+  /// The reasoning tiers of the current model. `nil` is the listing.
+  case effort(String?)
   case help
 }
 
@@ -83,11 +88,27 @@ public enum ChatCommandParser {
     // ask most, and `/use` and `/workspace` keep different meanings on purpose.
     case "workspace", "ws", "工作区":
       return rest.isEmpty ? .command(.workspaceList) : .command(.workspace(rest))
+    // `/model` carries at most two words — a target and an effort. A third is a typo, not a
+    // model name, and answering it as unknown keeps a stray sentence out of the model resolver.
+    case "model", "模型", "换模型":
+      let words = Self.words(rest)
+      guard words.count <= 2 else { return .unknown("model") }
+      return .command(.model(words.first, effort: words.count == 2 ? words[1] : nil))
+    case "effort", "thinking", "思考", "思考强度", "推理强度":
+      let words = Self.words(rest)
+      guard words.count <= 1 else { return .unknown("effort") }
+      return .command(.effort(words.first))
     case "help", "帮助", "?":
       return .command(.help)
     default:
       return .unknown(verb)
     }
+  }
+
+  /// Whitespace-separated words, so `/model　2　high` (an ideographic space from a phone
+  /// keyboard) parses like the ASCII spelling.
+  private static func words(_ text: String) -> [String] {
+    text.split(whereSeparator: { $0.isWhitespace }).map(String.init)
   }
 }
 
@@ -114,11 +135,19 @@ public enum ChatReply {
     /new（/新会话）— 解除绑定，下一条消息开新会话
     /workspace（/工作区）— 看有哪些工作区
     /workspace 2 — 切到第 2 个工作区（会解绑当前会话）
+    /model（/模型）— 看有哪些模型，以及当前用的是哪个
+    /model 2 — 切到第 2 个模型（用它的默认思考强度）
+    /model 2 high — 切模型并顺便指定思考强度
+    /effort（/思考）— 看当前模型支持哪些思考强度
+    /effort high — 只调思考强度（/effort 默认 恢复默认）
     /help — 这条帮助
 
     审批：需要你允许时机器人会直接问你，回复「批准」或「拒绝」。
     计划评审（plan mode）：回复「批准」开始执行，「拒绝」让它继续改，
     或「说 你的意见」把修改意见带回去。
+
+    手机远控开关（app 工具栏或微信渠道窗口）：开着时，上面这些审批与提问
+    会从任何会话推给你，并且桌面会话每轮结束时把结果和回复正文也转发过来。
     """
   }
 
@@ -271,6 +300,168 @@ public enum ChatReply {
 
   public static func workspaceListingUnavailable() -> String {
     "读不到 harness 的工作区列表（harness 目录不可用）。可以直接发 /workspace /绝对/路径 指定。"
+  }
+
+  // MARK: - Models and reasoning effort
+
+  /// How many catalog rows a phone listing shows before it stops numbering them.
+  public static let defaultModelLimit = 12
+
+  /// One catalog row: the number `/model <n>` uses, the current-marker, and the model id the
+  /// user would type if they preferred the explicit form.
+  static func modelRow(_ choice: HarnessModelChoice, index: Int, current: HarnessModelSelection?) -> String {
+    let isCurrent = choice.isSameModel(as: current)
+    let marker = isCurrent ? "●" : " "
+    var row = "\(index). \(marker) \(RemoteSessionHistory.clip(choice.name, to: 24))（\(choice.model)）"
+    if isCurrent, let pinned = current?.reasoningEffort, !pinned.isEmpty {
+      row += " · 强度 \(pinned)"
+    } else if !choice.efforts.isEmpty {
+      row += " · 强度 \(choice.efforts.map(\.id).joined(separator: "/"))"
+    }
+    return row
+  }
+
+  /// The numbered list `/model <n>` indexes into.
+  ///
+  /// Numbers are 1-based over *this* listing — the service keeps it, so a later `/model 2`
+  /// resolves against the rows the user actually read, exactly like `/use` and `/workspace`.
+  ///
+  /// - Parameter bound: whether the conversation already has a session. Without one the switch is
+  ///   still worth making (it is remembered for the next new session), so the footer says which
+  ///   of the two things will happen.
+  public static func modelList(
+    _ catalog: HarnessModelCatalog,
+    current: HarnessModelSelection?,
+    bound: Bool = true,
+    limit: Int = defaultModelLimit
+  ) -> String {
+    guard !catalog.choices.isEmpty else {
+      var text = "🤖 这个 harness 现在没有可用模型。"
+      if !catalog.failures.isEmpty {
+        text += "\n" + providerFailureNote(catalog)
+      }
+      text += "\n在桌面窗口的模型菜单里确认一下 provider 配置。"
+      return text
+    }
+
+    var lines = ["🤖 模型（共 \(catalog.choices.count) 个）"]
+    if let current {
+      lines.append("当前：\(RemoteSessionHistory.clip(current.model, to: 32)) · \(current.reasoningEffort ?? "默认强度")")
+    }
+    lines.append("")
+
+    var seenProvider: String?
+    for (offset, choice) in catalog.choices.prefix(limit).enumerated() {
+      if catalog.choices.contains(where: { $0.provider != choice.provider }) {
+        if seenProvider != choice.provider {
+          lines.append("【\(choice.providerName)】")
+          seenProvider = choice.provider
+        }
+      }
+      lines.append(modelRow(choice, index: offset + 1, current: current))
+    }
+    if catalog.choices.count > limit {
+      lines.append("")
+      lines.append("只显示了前 \(limit) 个，共 \(catalog.choices.count) 个；也可以直接发 /model 模型id。")
+    }
+    if !catalog.failures.isEmpty {
+      lines.append("")
+      lines.append(providerFailureNote(catalog))
+    }
+    lines.append("")
+    lines.append("● = 当前模型")
+    lines.append("/model 2 切换（用它默认的强度）· /model 2 high 同时指定强度")
+    lines.append(bound
+      ? "/effort 只调思考强度"
+      : "还没有绑定会话：切换会记下来，在下一条消息开的新会话上生效。")
+    return lines.joined(separator: "\n")
+  }
+
+  /// The numbered list `/effort <n>` indexes into.
+  public static func effortList(_ choice: HarnessModelChoice, current: HarnessModelSelection?) -> String {
+    guard !choice.efforts.isEmpty else {
+      return """
+      🧠 \(RemoteSessionHistory.clip(choice.name, to: 24))（\(choice.model)）不支持调思考强度。
+      它用的是 provider 指定的默认值，换一个支持推理的模型才能调。
+      """
+    }
+    var lines = ["🧠 \(RemoteSessionHistory.clip(choice.name, to: 24)) 的思考强度"]
+    lines.append(current?.reasoningEffort.map { "当前：\($0)" } ?? "当前：默认强度（provider 默认）")
+    lines.append("")
+    for (offset, effort) in choice.efforts.enumerated() {
+      let marker = current?.reasoningEffort == effort.id ? "●" : " "
+      var row = "\(offset + 1). \(marker) \(effort.id)"
+      if effort.name.lowercased() != effort.id.lowercased() { row += "（\(effort.name)）" }
+      if let detail = effort.detail, !detail.isEmpty {
+        row += " · \(RemoteSessionHistory.clip(detail.replacingOccurrences(of: "\n", with: " "), to: 24))"
+      }
+      lines.append(row)
+    }
+    lines.append("")
+    lines.append("● = 当前强度")
+    lines.append("/effort 2 或 /effort high 切换 · /effort 默认 恢复 provider 默认")
+    return lines.joined(separator: "\n")
+  }
+
+  /// A provider that could not enumerate its models. Reported rather than hidden: a short list
+  /// with a reason beats a short list that looks complete.
+  static func providerFailureNote(_ catalog: HarnessModelCatalog) -> String {
+    let names = catalog.failures.map { $0.name.isEmpty ? $0.id : $0.name }
+    return "⚠️ \(catalog.failures.count) 个 provider 枚举失败：\(names.joined(separator: "、"))"
+  }
+
+  public static func modelSelected(_ selection: HarnessModelSelection, bound: Bool) -> String {
+    let tail = bound
+      ? "下一条消息就会用它。"
+      : "还没有绑定会话：已经记下，会在下一条消息开的新会话上生效。"
+    return """
+    \(bound ? "✅ 模型已切换：" : "✅ 模型已选好：")\(RemoteSessionHistory.clip(selection.model, to: 32))
+    思考强度：\(selection.reasoningEffort ?? "默认强度")
+    \(tail)
+    """
+  }
+
+  public static func modelNotFound(_ target: String) -> String {
+    """
+    没有找到模型「\(RemoteSessionHistory.clip(target, to: 40))」。
+    发 /model 看编号，或直接发模型 id（例如 /model deepseek-chat）。
+    """
+  }
+
+  /// A model the catalog lists, but which exposes no reasoning tiers at all.
+  public static func effortUnsupported(_ choice: HarnessModelChoice) -> String {
+    "\(RemoteSessionHistory.clip(choice.name, to: 24))（\(choice.model)）不支持调思考强度，用的是 provider 默认值。"
+  }
+
+  public static func effortNotFound(_ target: String, choice: HarnessModelChoice) -> String {
+    """
+    没有找到思考强度「\(RemoteSessionHistory.clip(target, to: 24))」。
+    \(RemoteSessionHistory.clip(choice.name, to: 24)) 支持：\(choice.efforts.map(\.id).joined(separator: "、"))
+    也可以发 /effort 看编号，或 /effort 默认 恢复默认。
+    """
+  }
+
+  /// `/effort` when the model in force is not knowable — no session yet, or a host that does not
+  /// project the session's selection.
+  ///
+  /// Guessing the harness default here would be worse than asking: it would install an effort on a
+  /// model the user never chose, and a session whose model is pinned by an agent preset would be
+  /// silently retargeted.
+  public static func effortNeedsModel() -> String {
+    """
+    还不知道当前用的是哪个模型，列不出思考强度。
+    先发 /model 看清单并选一个模型，再发 /effort。
+    """
+  }
+
+  /// Whether a typed effort means "go back to whatever the provider defaults to".
+  ///
+  /// Clearing is a real operation, not a no-op: without the field the host resolves the model
+  /// again from scratch, while naming a tier pins it.
+  public static func isDefaultEffort(_ target: String) -> Bool {
+    ["默认", "默认强度", "default", "auto", "自动", "none", "无"].contains(
+      target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    )
   }
 
   public static func history(

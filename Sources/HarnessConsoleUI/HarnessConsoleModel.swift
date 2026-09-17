@@ -149,6 +149,20 @@ public final class HarnessConsoleModel: ObservableObject {
   /// sheet carries its own result line.
   @Published public private(set) var lastInstallMessage: String?
 
+  /// The last runtime-version change, either performed here or finished by a launch after a
+  /// crash. Loaded from disk at start so the explanation outlives the process that wrote it.
+  @Published public private(set) var upgradeReport: UpgradeReport?
+
+  /// Whether an update is running right now. Separate from `isBusy` because the buttons that
+  /// need disabling are the release ones, and the console has other long operations too.
+  @Published public private(set) var upgradeRunning = false
+
+  /// The release an in-flight upgrade would fall back to, when there is one.
+  ///
+  /// Read from the marker rather than remembered, because the upgrade that wrote it may have
+  /// been a previous launch's.
+  @Published public private(set) var pendingRollbackTarget: String?
+
   private var installer: HarnessInstaller?
   private var pluginStore: PluginStore?
   private var importer: ProfileImporter?
@@ -192,6 +206,14 @@ public final class HarnessConsoleModel: ObservableObject {
   /// Main-actor isolated because the only thing it does is drive the host's own picker,
   /// which lives on the main actor like every other window here.
   public var chooseWorkspace: (@MainActor () -> Void)?
+
+  /// Ask the host to move the runtime to another installed release.
+  ///
+  /// The host's main window owns the harness server, so the console cannot perform this
+  /// itself — a second launcher here would fight the first for the port, which is the same
+  /// reason this window's own Start button is fenced off when the app is running one. `nil`
+  /// until a host provides it, which turns the update controls into absent ones.
+  public var runUpgrade: (@MainActor (String) async -> UpgradeReport)?
 
   /// The chosen folder as a URL, or `nil` when the host supplied none.
   ///
@@ -268,6 +290,10 @@ public final class HarnessConsoleModel: ObservableObject {
       return false
     }
     await refresh()
+    // Read from disk rather than only from this process: the report that matters most is the
+    // one written by an upgrade that failed while the app was being restarted.
+    upgradeReport = UpgradeReportStore(paths: paths).loadLatest()
+    refreshUpgradeState()
     return true
   }
 
@@ -314,6 +340,8 @@ public final class HarnessConsoleModel: ObservableObject {
     } catch {
       append(.failure, describe(error))
     }
+    // The list decides which Remove buttons are live, and that depends on the marker.
+    refreshUpgradeState()
   }
 
   public func refreshProfiles() async {
@@ -497,6 +525,118 @@ public final class HarnessConsoleModel: ObservableObject {
       self.append(.success, "Removed \(id).")
       await self.refreshReleases()
     }
+  }
+
+  // MARK: - Upgrading
+
+  /// Whether this host wired an upgrade path. Without one the update controls are absent
+  /// rather than present-and-dead.
+  public var canUpdate: Bool { runUpgrade != nil }
+
+  /// Re-read the marker that names an in-flight upgrade's rollback target.
+  ///
+  /// Drives which Remove buttons are live: deleting that release mid-upgrade would leave the
+  /// upgrade with nothing to fall back to, which is the exact state it refuses to start in.
+  public func refreshUpgradeState() {
+    pendingRollbackTarget = PendingUpgradeStore(paths: paths).record?.fromReleaseID
+  }
+
+  /// Whether this release may be removed right now.
+  public func canRemove(_ release: HarnessRelease) -> Bool {
+    release.id != activeReleaseID && release.id != pendingRollbackTarget && !isBusy
+  }
+
+  /// Download a version and then move to it, as one action.
+  ///
+  /// The install deliberately does **not** activate: the coordinator activates, restarts, and
+  /// verifies in that order, and activating here first would open a window in which the new
+  /// release is already live and nothing has checked it yet.
+  public func downloadAndUpdate(_ candidate: HarnessUpdateCandidate) async {
+    guard let installer else { return }
+    guard !isBusy, !upgradeRunning else {
+      append(.warning, "另一个操作正在进行，本次未执行。")
+      return
+    }
+
+    isBusy = true
+    busyLabel = "下载 \(candidate.version)"
+    append(.info, "下载 \(candidate.version)（先不激活）…")
+    let releaseID: String
+    do {
+      let outcome = try await installer.install(
+        candidate.source,
+        activate: false,
+        progress: progressReporter
+      )
+      for warning in outcome.warnings { append(.warning, warning) }
+      releaseID = outcome.release.id
+      append(
+        .success,
+        outcome.reused ? "\(releaseID) 已经在本地，直接复用。" : "已下载 \(releaseID)。"
+      )
+      await refreshReleases()
+    } catch {
+      append(.failure, describe(error))
+      isBusy = false
+      busyLabel = nil
+      return
+    }
+    isBusy = false
+    busyLabel = nil
+
+    await update(toReleaseID: releaseID)
+  }
+
+  /// Move the runtime to an already installed release, with automatic fallback.
+  public func update(toReleaseID id: String) async {
+    guard let runUpgrade else {
+      append(.failure, "这个宿主没有接入版本更新，请在主窗口里更新。")
+      return
+    }
+    guard !isBusy, !upgradeRunning else {
+      append(.warning, "另一个操作正在进行，本次未执行。")
+      return
+    }
+
+    isBusy = true
+    upgradeRunning = true
+    busyLabel = "更新到 \(id)"
+    append(.info, "更新到 \(id)：激活 → 重启 → 自检…")
+    let report = await runUpgrade(id)
+    upgradeReport = report
+    upgradeRunning = false
+    isBusy = false
+    busyLabel = nil
+
+    append(report.outcome == .kept ? .success : .warning, report.summary)
+    if let failure = report.bootFailure {
+      // Verbatim: the harness's own output is the only thing that says why, and it goes into
+      // the log so it is still readable after the report card is scrolled away.
+      append(.failure, failure)
+    }
+    for check in report.checks where check.verdict != .pass {
+      append(
+        check.verdict == .fail ? .failure : .warning,
+        "\(check.name): \(check.verdict.displayName) — \(check.detail)"
+      )
+    }
+    for note in report.notes { append(.warning, note) }
+
+    await refreshReleases()
+    await refreshServer()
+    refreshUpgradeState()
+  }
+
+  /// Undo an upgrade: move back to the release it came from.
+  ///
+  /// The same operation as updating, in the other direction — which is the point. The version
+  /// being returned to deserves the same verification, because it may be the broken one.
+  public func rollback(_ report: UpgradeReport) async {
+    guard let target = report.fromReleaseID else {
+      append(.failure, "这份报告没有记录可回退的版本。")
+      return
+    }
+    await update(toReleaseID: target)
   }
 
   // MARK: - Running the harness

@@ -34,6 +34,19 @@ public struct HarnessAPIResponse: Sendable {
 
 public protocol HarnessAPITransport: Sendable {
   func send(_ request: HarnessAPIRequest) async throws -> HarnessAPIResponse
+
+  /// Release whatever outlives one request: connection pools, sockets, descriptors.
+  ///
+  /// A requirement with a default implementation rather than an extension-only method. Callers
+  /// hold `any HarnessAPITransport`, and a method that is not a requirement dispatches
+  /// statically — the concrete transport's own implementation would never run and the pool it
+  /// exists to release would leak. Stateless transports (every test double) inherit the default.
+  func invalidate()
+}
+
+extension HarnessAPITransport {
+  /// Nothing to release.
+  public func invalidate() {}
 }
 
 /// Refuse redirects so the caller sees the response that carried the credential.
@@ -69,6 +82,26 @@ public final class URLSessionHarnessTransport: HarnessAPITransport, @unchecked S
     configuration.httpCookieAcceptPolicy = .always
     configuration.httpShouldSetCookies = true
     session = URLSession(configuration: configuration, delegate: NoRedirects(), delegateQueue: nil)
+  }
+
+  /// The session itself, so a caller that also needs a WebSocket (the `$events` stream) shares
+  /// one connection pool instead of standing up a second pool that nothing ever tears down.
+  var connectionSession: URLSession { session }
+
+  /// Close every connection this transport owns.
+  ///
+  /// Foundation keeps a session's connections — and therefore its descriptors — alive until the
+  /// session is invalidated, so "the transport went out of scope" is not enough. Measured on
+  /// this app: an evening of per-operation transports left ~4 800 closed-but-open sockets in the
+  /// process, which is what `EMFILE` (and a state file that could no longer be written) looked
+  /// like from the outside.
+  public func invalidate() {
+    session.invalidateAndCancel()
+  }
+
+  deinit {
+    // Backstop for a transport dropped without an explicit `invalidate()`.
+    session.invalidateAndCancel()
   }
 
   public func send(_ request: HarnessAPIRequest) async throws -> HarnessAPIResponse {
@@ -141,6 +174,14 @@ public actor HarnessAPIClient {
   public init(baseURL: URL, transport: HarnessAPITransport = URLSessionHarnessTransport()) {
     self.baseURL = baseURL
     self.transport = transport
+  }
+
+  /// Release the transport's connections.
+  ///
+  /// Only the owner of the transport may call this: a pool shared by several clients has to
+  /// outlive all of them, and invalidating it turns every later call into a transport error.
+  public nonisolated func invalidate() {
+    transport.invalidate()
   }
 
   /// Split the token-bearing URL the harness prints into an origin and a launch token.
@@ -233,7 +274,15 @@ public actor HarnessAPIClient {
     guard let url = components.url else {
       throw HarnessAPIError(code: .invalidURL, message: "无法构造事件流地址")
     }
-    return RemoteEventStream(client: self, webSocketURL: url, cookie: cookie)
+    return RemoteEventStream(
+      client: self,
+      webSocketURL: url,
+      cookie: cookie,
+      // Borrow the transport's pool when there is one. A stream that brings its own session
+      // would add a second pool per reconnect — the relay reconnects on every dropped socket,
+      // so that is the difference between one pool and thousands.
+      session: (transport as? URLSessionHarnessTransport)?.connectionSession
+    )
   }
 
   public func call(endpoint: String, args: JSONValue) async throws -> JSONValue {
@@ -364,6 +413,52 @@ public actor HarnessAPIClient {
     return requestId
   }
 
+  /// Every model the host will route to, with the reasoning tiers each one accepts.
+  ///
+  /// This is the same catalog the desktop model menu reads, so a model that is missing here is a
+  /// model the GUI does not offer either, and a provider that failed to enumerate itself comes back
+  /// in `failures` instead of silently shrinking the list.
+  public func modelCatalog() async throws -> HarnessModelCatalog {
+    let value = try await call(endpoint: "session/modelCatalog", args: .object([:]))
+    return HarnessModelCatalog.decode(value)
+  }
+
+  /// Pin one session's model and reasoning effort for its next turn.
+  ///
+  /// The host validates the triple against the live adapters and records it durably on the
+  /// session, so this works on an idle session, on one that has never been prompted, and on a
+  /// session that is currently running (the change lands on the next request).
+  ///
+  /// - Parameter reasoningEffort: an adapter-owned tier id, or `nil` to fall back to the
+  ///   provider's own default. Omitting the field is how the host is told "no preference" — it is
+  ///   not the same request as naming a tier.
+  /// - Returns: the normalized selection the host actually installed, which is authoritative:
+  ///   an adapter may canonicalize what it was asked for.
+  @discardableResult
+  public func selectModel(
+    sessionID: String,
+    provider: String,
+    model: String,
+    reasoningEffort: String? = nil
+  ) async throws -> HarnessModelSelection {
+    var request: [String: JSONValue] = [
+      "sessionId": .string(sessionID),
+      "provider": .string(provider),
+      "model": .string(model),
+    ]
+    if let reasoningEffort, !reasoningEffort.isEmpty {
+      request["reasoningEffort"] = .string(reasoningEffort)
+    }
+    let value = try await call(
+      endpoint: "session/selectModel",
+      args: .object(["request": .object(request)])
+    )
+    guard let selected = HarnessModelSelection.decode(value["selected"]) else {
+      throw HarnessAPIError(code: .malformedEnvelope, message: "session/selectModel 没有返回生效的模型")
+    }
+    return selected
+  }
+
   /// Every session the harness knows about, newest activity first.
   ///
   /// The wire parameter of this one endpoint is literally `_request` (every other Session RPC
@@ -378,15 +473,35 @@ public actor HarnessAPIClient {
   ///
   /// `updatedAt` is epoch **milliseconds** on this wire. The magnitude check keeps a payload
   /// that switched to seconds from rendering as 1970.
+  ///
+  /// The model fields come from the `modelSelection` projection: `next` is the pending choice when
+  /// one is installed and otherwise the model the last request used, which is exactly "what this
+  /// session will run next". Rows from a host too old to project it simply carry no model.
   public static func sessionSummaries(from value: JSONValue) -> [SessionSummary] {
     (value["items"]?.arrayValue ?? []).compactMap { item in
       guard let id = item["sessionId"]?.stringValue, !id.isEmpty else { return nil }
+      let projection = item.path("projections.values.modelSelection")
+      let selection = HarnessModelSelection.decode(projection?["next"])
+        ?? HarnessModelSelection.decode(projection?["lastUsed"])
+      // Subagent-ness travels as two independent signals and either one is enough: a child names its
+      // parent, while a session launched as a subagent carries `origin` and may name no parent.
+      // Missing this is not cosmetic — the turn watcher picks which sessions to follow by recency,
+      // so a fan-out's sessions would take the user's own slots *and* push their turns to the phone.
+      let parentID = item["parentSessionId"]?.stringValue.flatMap { value -> SessionID? in
+        value.isEmpty ? nil : SessionID(value)
+      }
+      let isSubagent = parentID != nil || item["origin"]?.stringValue == "subagent"
       return SessionSummary(
         id: SessionID(id),
         title: item.path("projections.values.title")?.stringValue,
         cwd: item["cwd"]?.stringValue,
         updatedAt: epochDate(item["updatedAt"]?.doubleValue),
-        isLive: item["running"]?.boolValue ?? false
+        model: selection?.model,
+        provider: selection?.provider,
+        reasoningEffort: selection?.reasoningEffort,
+        parentID: parentID,
+        isLive: item["running"]?.boolValue ?? false,
+        isSubagent: isSubagent
       )
     }
   }

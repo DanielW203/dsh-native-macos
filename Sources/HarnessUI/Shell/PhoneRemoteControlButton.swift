@@ -1,11 +1,16 @@
 import SwiftUI
 
-/// The toolbar switch that lets the phone answer what the harness is waiting on.
+/// The toolbar switch that lets the phone answer what the harness is waiting on — and hear what the
+/// harness finished.
 ///
-/// The state lives in the channel service, not in this view: the button is only a face on "is
-/// the phone on the hook right now". When it is on it is tinted and carries the number of
-/// requests still waiting, so work that is blocked on the phone stays visible from the window
-/// the user is actually looking at.
+/// One switch, two directions: while it is on, approvals and questions from any session are pushed to
+/// the phone, and desktop sessions forward each finished turn (a result line plus the reply it
+/// produced). Both are decided by the service, so the button stays a face on "is the phone on the
+/// hook right now" rather than becoming a second place that knows the rules.
+///
+/// The state lives in the channel service, not in this view. When it is on it is tinted and carries
+/// the number of requests still waiting, so work that is blocked on the phone stays visible from the
+/// window the user is actually looking at.
 ///
 /// It is deliberately in-memory in the service: switching it on is a decision about this run,
 /// and a setting that survived a restart would silently reroute requests the user has stopped

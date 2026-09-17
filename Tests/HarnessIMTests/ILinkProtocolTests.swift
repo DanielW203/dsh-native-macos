@@ -65,4 +65,43 @@ final class ILinkProtocolTests: XCTestCase {
     XCTAssertEqual(ILinkResponse.rejectionCode(try JSONValue.parse(#"{ "ret": -3 }"#)), "-3")
     XCTAssertEqual(ILinkResponse.rejectionCode(try JSONValue.parse(#"{ "ret": "token-expired" }"#)), "token-expired")
   }
+
+  /// An expired session is reported as `errcode: -14`, not as `ret`, and it can arrive beside a
+  /// `ret` that says nothing. Reading only `ret` is how a dead session looks like a healthy one.
+  func testRejectionCodeAlsoReadsERRCODE() throws {
+    XCTAssertEqual(ILinkResponse.rejectionCode(try JSONValue.parse(#"{ "errcode": -14 }"#)), "-14")
+    XCTAssertEqual(
+      ILinkResponse.rejectionCode(try JSONValue.parse(#"{ "ret": 0, "errcode": -14 }"#)),
+      "-14"
+    )
+    XCTAssertNil(ILinkResponse.rejectionCode(try JSONValue.parse(#"{ "ret": 0, "errcode": 0 }"#)))
+    // `ret` still wins when both are set: it is the per-call verdict.
+    XCTAssertEqual(
+      ILinkResponse.rejectionCode(try JSONValue.parse(#"{ "ret": -2, "errcode": -14 }"#)),
+      "-2"
+    )
+  }
+
+  /// The two codes that need different handling, and the rule that an unknown one is carried
+  /// verbatim rather than guessed at.
+  func testRejectionClassification() {
+    XCTAssertEqual(ILinkRejection(rawCode: "-14"), .sessionExpired)
+    XCTAssertEqual(ILinkRejection(rawCode: "-2"), .invalidRequest)
+    XCTAssertEqual(ILinkRejection(rawCode: "-3"), .other("-3"))
+    XCTAssertEqual(ILinkRejection(rawCode: "token-expired"), .other("token-expired"))
+  }
+
+  /// A rejection's own sentence is the only thing that says *which* parameter was wrong.
+  func testRejectionDetailIsReadFromTheProviderBody() throws {
+    XCTAssertEqual(
+      ILinkResponse.errorDetail(try JSONValue.parse(#"{ "ret": -2, "errmsg": "text too long" }"#)),
+      "：text too long"
+    )
+    XCTAssertEqual(
+      ILinkResponse.errorDetail(try JSONValue.parse(#"{ "ret": -2, "msg": "bad token" }"#)),
+      "：bad token"
+    )
+    XCTAssertEqual(ILinkResponse.errorDetail(try JSONValue.parse(#"{ "ret": -2, "errmsg": "  " }"#)), "")
+    XCTAssertEqual(ILinkResponse.errorDetail(try JSONValue.parse(#"{ "ret": -2 }"#)), "")
+  }
 }

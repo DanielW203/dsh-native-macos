@@ -238,6 +238,13 @@ public actor HarnessInstaller {
     guard ledger.release(id: id) != nil else { throw RuntimeError.releaseNotFound(id) }
     if ledger.active == id { throw RuntimeError.releaseInUse(id) }
 
+    // An upgrade that is still in flight names this release as its way back. Deleting it
+    // would leave the pending marker pointing at a directory that no longer exists, which is
+    // exactly the "no way back" state the upgrade refuses to start in.
+    if PendingUpgradeStore(paths: paths).record?.fromReleaseID == id {
+      throw RuntimeError.releaseIsRollbackTarget(id)
+    }
+
     // Only the servers belonging to *this* release are stopped: removing one old runtime
     // is not a reason to interrupt a server the user is working through right now.
     let stragglers = HarnessServerRecord.runningServers(in: paths.releaseDirectory(id))

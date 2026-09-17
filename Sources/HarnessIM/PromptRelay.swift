@@ -353,12 +353,16 @@ public actor PromptRelay {
   private func consume() async {
     var attempt = 0
     while !Task.isCancelled {
+      // Did this connection carry anything at all? A carrier that opens and immediately ends is
+      // not the success worth a fresh backoff: resetting the counter on `open()` alone means a
+      // flapping host is retried once a second forever, at one socket per lap.
+      var carried = false
       do {
         let frames = try await stream.open()
-        attempt = 0
         publish(connection: .connected)
         for try await frame in frames {
           if Task.isCancelled { break }
+          carried = true
           await handle(frame)
         }
       } catch {
@@ -371,6 +375,7 @@ public actor PromptRelay {
         clientID = nil
       }
       if Task.isCancelled { break }
+      if carried { attempt = 0 }
 
       attempt += 1
       if let maximum = reconnect.maximumAttempts, attempt > maximum {

@@ -1,4 +1,5 @@
 import HarnessConsoleUI
+import HarnessRuntime
 import HarnessUI
 import SwiftUI
 
@@ -25,6 +26,18 @@ struct HarnessConsoleWindow: View {
         model.presentedAsEmbeddedWindow = true
         model.workspacePath = workspace.workspacePath
         model.chooseWorkspace = { [weak workspace] in workspace?.chooseWorkspace() }
+        // Same bridge, same reason: the main window owns the server, so moving it to another
+        // release is something only it can do. The console asks; the window acts.
+        model.runUpgrade = { [weak workspace] id in
+          guard let workspace else {
+            return UpgradeReport(
+              toReleaseID: id,
+              outcome: .aborted,
+              summary: "主窗口已关闭，本次更新未执行。"
+            )
+          }
+          return await workspace.updateHarness(toReleaseID: id)
+        }
       }
       // The main window can change the folder too (its own picker, from the "not running"
       // panel), so the console follows the model rather than reading it once.

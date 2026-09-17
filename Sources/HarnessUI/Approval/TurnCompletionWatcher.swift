@@ -29,12 +29,25 @@ public actor TurnCompletionWatcher {
     public var isSubagent: Bool
     /// When the session was last active, used to choose which targets survive the cap.
     public var updatedAt: Date?
+    /// The session's working directory.
+    ///
+    /// Carried through to the completion because a session's log is located by it: a forwarder that
+    /// wants to say what the turn *answered* cannot find the log without it, and re-reading the
+    /// session list at that moment would race the very turn that just ended.
+    public var cwd: String?
 
-    public init(sessionID: String, title: String? = nil, isSubagent: Bool = false, updatedAt: Date? = nil) {
+    public init(
+      sessionID: String,
+      title: String? = nil,
+      isSubagent: Bool = false,
+      updatedAt: Date? = nil,
+      cwd: String? = nil
+    ) {
       self.sessionID = sessionID
       self.title = title
       self.isSubagent = isSubagent
       self.updatedAt = updatedAt
+      self.cwd = cwd
     }
   }
 
@@ -69,6 +82,12 @@ public actor TurnCompletionWatcher {
   private var isStopped = false
   /// Sessions whose stream ended and which should not be re-subscribed until they are named again.
   private var blocked: Set<String> = []
+  /// The highest durable sequence accounted for, per session.
+  ///
+  /// `nil` means "no baseline yet": that session's first snapshot is history and must not be
+  /// announced. Dropped whenever a subscription is cancelled or written off, so a session that
+  /// returns to the target set re-baselines instead of replaying everything since it left.
+  private var watermark: [String: Int] = [:]
 
   public init(
     sessionLimit: Int = TurnCompletionWatcher.defaultSessionLimit,
@@ -111,6 +130,9 @@ public actor TurnCompletionWatcher {
       task.cancel()
       subscriptions[id] = nil
       states[id] = nil
+      // Its baseline goes with it: a session that comes back later must not replay everything that
+      // happened while it was outside the target set.
+      watermark[id] = nil
     }
     for id in wanted where subscriptions[id] == nil && !blocked.contains(id) {
       start(id)
@@ -134,6 +156,7 @@ public actor TurnCompletionWatcher {
     for task in subscriptions.values { task.cancel() }
     subscriptions.removeAll()
     states.removeAll()
+    watermark.removeAll()
   }
 
   // MARK: - Subscription lifecycle
@@ -154,27 +177,40 @@ public actor TurnCompletionWatcher {
   /// followed does not become a busy loop. A *refusal* is different: the harness answered, and the
   /// answer was no. After a few of those the session is written off, because what the harness lacks
   /// is the capability rather than the connection.
+  ///
+  /// Two rules make a reconnect survivable, and both come from watching a live harness:
+  ///
+  /// 1. **Catch up from the opening page.** Measured against a session that is actually running, the
+  ///    harness closes a subscription taken mid-turn almost immediately, so a re-subscription's
+  ///    snapshot is exactly the gap the dead stream left. Ignoring it (as "the past") swallows every
+  ///    ending of any session in use — the failure this used to have: the phone got nothing at all.
+  /// 2. **Only a stream that carried something earns a fast retry.** Resetting the backoff on a
+  ///    successful *open* turns that immediate close into a storm: one session was re-snapshotting
+  ///    roughly 1.9 MB every 12 seconds, for hours.
   private func run(sessionID: String) async {
     var backoff = retryBase
     var refusals = 0
 
     while !Task.isCancelled && !isStopped {
+      var carriedLiveFrame = false
       do {
         let follower = try await followerFactory(sessionID)
         let stream = try await follower.openStream(sessionID: sessionID)
         states[sessionID] = .live
-        backoff = retryBase
-        refusals = 0
 
         var sawSnapshot = false
         for try await frame in stream {
           if Task.isCancelled { break }
           switch frame {
-          case .snapshot:
-            // Everything before this belongs to the past; only what follows is live.
+          case .snapshot(let cursor, let records):
             sawSnapshot = true
-          case .event(let type, _, let turn, let data):
+            await catchUp(sessionID: sessionID, cursor: cursor, records: records)
+          case .event(let type, let seq, let turn, let data):
             guard sawSnapshot else { continue }
+            carriedLiveFrame = true
+            // The catch-up may already have delivered this one: the page can overlap frames the
+            // previous stream had in flight. Announcing a turn twice is worse than missing it.
+            guard isNewer(seq, for: sessionID) else { continue }
             await report(sessionID: sessionID, type: type, turn: turn, data: data)
           case .assistantStream, .unrecognized:
             continue
@@ -193,10 +229,18 @@ public actor TurnCompletionWatcher {
             states[sessionID] = .unavailable(Self.describe(error))
             blocked.insert(sessionID)
             subscriptions[sessionID] = nil
+            watermark[sessionID] = nil
             return
           }
         }
         states[sessionID] = .connecting
+      }
+
+      if carriedLiveFrame {
+        backoff = retryBase
+        refusals = 0
+      } else {
+        backoff = min(backoff * 2, retryCeiling)
       }
 
       do {
@@ -204,9 +248,35 @@ public actor TurnCompletionWatcher {
       } catch {
         break
       }
-      backoff = min(backoff * 2, retryCeiling)
     }
     if !isStopped { states[sessionID] = .stopped }
+  }
+
+  /// Whether a live frame is newer than everything already accounted for, recording it if so.
+  ///
+  /// A frame without a sequence number cannot be placed, so it is reported: the alternative is to
+  /// drop an ending because the harness stopped numbering its events.
+  private func isNewer(_ seq: Int?, for sessionID: String) -> Bool {
+    guard let seq else { return true }
+    if let accounted = watermark[sessionID], seq <= accounted { return false }
+    watermark[sessionID] = seq
+    return true
+  }
+
+  /// Announce the endings a re-subscription's opening page contains.
+  ///
+  /// The page is history on the *first* subscription — no baseline yet — and the gap on every
+  /// reconnect after it. Only the second case is news; the first is what keeps an app restart from
+  /// replaying yesterday's turns as notifications.
+  private func catchUp(sessionID: String, cursor: Int, records: [SessionFollowRecord]) async {
+    let baseline = watermark[sessionID]
+    var highest = cursor
+    for record in records {
+      if let seq = record.seq, seq > highest { highest = seq }
+      guard let baseline, let seq = record.seq, seq > baseline else { continue }
+      await report(sessionID: sessionID, type: record.type, turn: record.turn, data: record.data)
+    }
+    watermark[sessionID] = highest
   }
 
   private func report(sessionID: String, type: String, turn: Int?, data: JSONValue) async {
@@ -216,7 +286,8 @@ public actor TurnCompletionWatcher {
       eventType: type,
       data: data,
       sessionTitle: target?.title,
-      isSubagent: target?.isSubagent ?? false
+      isSubagent: target?.isSubagent ?? false,
+      cwd: target?.cwd
     ) else { return }
     if completion.turn == nil { completion.turn = turn }
     guard completion.kind.deservesNotification else { return }

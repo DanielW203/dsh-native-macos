@@ -19,31 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
----
-
-## Third-party notices
-
-This repository's own source code is MIT-licensed as above. Files that come from
-elsewhere keep their own licenses:
-
-- `Vendor/zstd/**` — Zstandard, Copyright (c) Meta Platforms, Inc. and affiliates,
-  dual-licensed BSD-3-Clause OR GPL-2.0. See `Vendor/zstd/LICENSE` and
-  `Vendor/zstd/COPYING`. This project uses it under BSD-3-Clause.
-- `@deepseek-ai/dsh` and the DeepSeek Harness itself are **not** included in this
-  repository. They are downloaded at runtime from the npm registry and remain under
-  their own license and terms. "DeepSeek" and the DeepSeek Harness are the property of
-  their respective owners; this project is an independent, unofficial client and claims
-  no affiliation with or endorsement by DeepSeek.
-
----
-
-## Derived specification files
-
-The following files contain material derived from the official DeepSeek Harness
-(`@deepseek-ai/dsh`, MIT License, Copyright (c) 2026 DeepSeek) and are
-redistributed here under the same MIT terms with this attribution:
-
-- `Spec/**` — specification fixtures extracted from the official runtime
-- `Sources/HarnessCore/Tools/Generated/ToolSchemas.swift` — generated from the
-  official tool catalog

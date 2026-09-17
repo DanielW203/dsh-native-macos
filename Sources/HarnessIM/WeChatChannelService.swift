@@ -89,9 +89,17 @@ public actor WeChatChannelService {
   private let dshHome: DSHHomeProvider
   private let client: ILinkClient
   private let replyConfiguration: SessionReplySource.Configuration
-  private let harnessTransport: HarnessTransportFactory
+  private let makeHarnessTransport: HarnessTransportFactory
   private let replySourceFactory: ReplySourceFactory
   private let approvalStreamFactory: ApprovalStreamFactory
+  /// The one transport this channel talks to the harness through.
+  ///
+  /// The factory used to be called per operation, so every `/list`, submission and repair pass
+  /// built its own `URLSession`. A session keeps its connections — and their descriptors — until
+  /// it is invalidated, and none of them were: two hours of use left ~4 800 dead sockets in the
+  /// process, after which even writing `state.json` failed with a bare Cocoa 512 (the write needs
+  /// a descriptor too) and the harness looked unreachable because `open()` answered `EMFILE`.
+  private var sharedHarnessTransport: HarnessAPITransport?
   private var promptRelay: PromptRelay?
   /// Whether all sessions' approvals go to the phone. Never persisted: see `ChannelStatus`.
   private var forwardsAllPrompts = false
@@ -115,6 +123,21 @@ public actor WeChatChannelService {
   /// against a fresh read could move the channel to a folder the user never saw. In-memory on
   /// purpose — a stale list after a restart is exactly the mis-switch this is here to prevent.
   private var workspaceListings: [String: [HarnessWorkspace]] = [:]
+  /// WeChat sender → the model rows it was last shown by `/model`.
+  ///
+  /// Same reasoning again: `/model 2` must mean the second row the user read, not the second row
+  /// of a catalog that a provider enumerated differently a moment later.
+  private var modelListings: [String: [HarnessModelChoice]] = [:]
+  /// WeChat sender → what it was last shown by `/effort`, as (the model those tiers belong to,
+  /// the tiers). Kept per sender for the same reason as `modelListings`.
+  private var effortListings: [String: (choice: HarnessModelChoice, efforts: [HarnessModelEffort])] = [:]
+  /// WeChat sender → the model/effort it asked for, kept so a session created *later* still starts
+  /// on it.
+  ///
+  /// A selection lives on a session, so a `/model` typed before the first message has nothing to
+  /// attach to. Remembering it here is what makes "先选模型，再开会话" work; in-memory on purpose,
+  /// because the harness itself is the durable record for every session that exists.
+  private var preferredSelections: [String: HarnessModelSelection] = [:]
   /// Downloaded attachment bytes, keyed by batch item, so a batch survives the wait between
   /// "file received" and "trigger phrase received".
   private var attachmentData: [String: Data] = [:]
@@ -148,7 +171,7 @@ public actor WeChatChannelService {
     self.dshHome = dshHome
     self.client = client
     self.replyConfiguration = replyConfiguration
-    self.harnessTransport = harnessTransport
+    self.makeHarnessTransport = harnessTransport
     self.replySourceFactory = replySourceFactory
     self.approvalStreamFactory = approvalStreamFactory
     self.config = Self.canonicalized(store.loadConfig())
@@ -420,11 +443,18 @@ public actor WeChatChannelService {
       } catch is CancellationError {
         return
       } catch {
-        let message = (error as? ILinkError)?.message ?? String(describing: error)
+        let failure = error as? ILinkError
+        let message = failure?.message ?? String(describing: error)
         state.lastError = message
+        // An expired session is the one rejection a re-bind can fix. A refused *request* (a
+        // wrong parameter, say) is not: treating every non-zero `ret` as terminal is what
+        // stopped the poll for good and told the user to re-bind a perfectly healthy channel.
+        let terminal = failure?.code == .sessionExpired
+        if terminal {
+          // Protocol rule: the cached conversation tokens belong to the session that ended.
+          state.contextTokens.removeAll()
+        }
         persist()
-        // An unauthorized provider is a re-bind situation, not something to retry forever.
-        let terminal = (error as? ILinkError)?.code == .providerRejected
         publish {
           $0.phase = terminal ? .needsLogin : .degraded
           $0.lastError = message
@@ -580,6 +610,10 @@ public actor WeChatChannelService {
       await listWorkspaces(sender: sender, message: message)
     case .command(.workspace(let target)):
       await switchWorkspace(sender: sender, target: target, message: message)
+    case .command(.model(let target, let effort)):
+      await model(sender: sender, target: target, effort: effort, message: message)
+    case .command(.effort(let target)):
+      await effort(sender: sender, target: target, message: message)
     }
   }
 
@@ -781,6 +815,224 @@ public actor WeChatChannelService {
     }
   }
 
+  // MARK: - Models and reasoning effort
+
+  /// What a typed effort matched.
+  enum EffortResolution: Sendable, Equatable {
+    /// An adapter-owned tier id.
+    case tier(String)
+    /// "No preference" — the request carries no effort at all and the host resolves the provider's
+    /// own default. Distinct from every named tier, including one that happens to be the default.
+    case providerDefault
+    case unknown
+  }
+
+  /// `/model` — the catalog, or a switch, optionally pinning an effort at the same time.
+  private func model(
+    sender: String,
+    target: String?,
+    effort: String?,
+    message: WeChatInboundMessage
+  ) async {
+    let client: HarnessAPIClient
+    let catalog: HarnessModelCatalog
+    do {
+      (client, catalog) = try await modelContext()
+    } catch {
+      await reply(to: message, text: modelCatalogFailure(error))
+      return
+    }
+    let bound = binding(for: sender) != nil
+    let current = await currentSelection(client: client, sender: sender)
+
+    guard let target, !target.isEmpty else {
+      modelListings[sender] = catalog.choices
+      await reply(to: message, text: ChatReply.modelList(catalog, current: current, bound: bound))
+      return
+    }
+    guard let picked = Self.resolveModel(target: target, shown: modelListings[sender], catalog: catalog) else {
+      await reply(to: message, text: ChatReply.modelNotFound(target))
+      return
+    }
+    guard let effort, !effort.isEmpty else {
+      await install(picked.defaultSelection, sender: sender, client: client, message: message)
+      return
+    }
+    // A named effort is validated against *this* model's tiers: sending "high" to an adapter that
+    // spells it "HIGH", or has no such tier, would be rejected by the host with a much less
+    // actionable error than the list this reports.
+    switch Self.resolveEffort(effort, choice: picked) {
+    case .unknown:
+      await reply(to: message, text: ChatReply.effortNotFound(effort, choice: picked))
+    case .tier(let id):
+      await install(
+        HarnessModelSelection(provider: picked.provider, model: picked.model, reasoningEffort: id),
+        sender: sender, client: client, message: message
+      )
+    case .providerDefault:
+      await install(
+        HarnessModelSelection(provider: picked.provider, model: picked.model, reasoningEffort: nil),
+        sender: sender, client: client, message: message
+      )
+    }
+  }
+
+  /// `/effort` — the tiers of the model in force, or a switch to one of them.
+  private func effort(sender: String, target: String?, message: WeChatInboundMessage) async {
+    let client: HarnessAPIClient
+    let catalog: HarnessModelCatalog
+    do {
+      (client, catalog) = try await modelContext()
+    } catch {
+      await reply(to: message, text: modelCatalogFailure(error))
+      return
+    }
+    let current = await currentSelection(client: client, sender: sender)
+    // Only *known* models are acceptable here. The model in force wins; the last listing answers
+    // when the host did not project one; whatever the conversation asked for earlier is the last
+    // fallback. The catalog's own default is deliberately **not** a candidate: installing an effort
+    // on it would silently move a session whose model the channel could not read — including one
+    // whose model is pinned by an agent preset — so that case asks the user to choose instead.
+    guard let choice = catalog.choice(for: current)
+      ?? effortListings[sender]?.choice
+      ?? catalog.choice(for: preferredSelections[sender]) else {
+      await reply(to: message, text: ChatReply.effortNeedsModel())
+      return
+    }
+    guard !choice.efforts.isEmpty else {
+      await reply(to: message, text: ChatReply.effortUnsupported(choice))
+      return
+    }
+
+    guard let target, !target.isEmpty else {
+      effortListings[sender] = (choice, choice.efforts)
+      await reply(to: message, text: ChatReply.effortList(choice, current: current))
+      return
+    }
+
+    // An index only means something against the listing it came from, and only while that listing
+    // is about the same model — otherwise "2" would silently pick a tier of a different model.
+    let shown = effortListings[sender].flatMap { listing in
+      listing.choice.provider == choice.provider && listing.choice.model == choice.model
+        ? listing.efforts
+        : nil
+    } ?? []
+    let resolution: EffortResolution
+    if let index = Int(target.trimmingCharacters(in: .whitespacesAndNewlines)), index >= 1, index <= shown.count {
+      resolution = .tier(shown[index - 1].id)
+    } else if indexLike(target) {
+      resolution = .unknown
+    } else {
+      resolution = Self.resolveEffort(target, choice: choice)
+    }
+
+    switch resolution {
+    case .unknown:
+      await reply(to: message, text: ChatReply.effortNotFound(target, choice: choice))
+    case .tier(let id):
+      await install(
+        HarnessModelSelection(provider: choice.provider, model: choice.model, reasoningEffort: id),
+        sender: sender, client: client, message: message
+      )
+    case .providerDefault:
+      await install(
+        HarnessModelSelection(provider: choice.provider, model: choice.model, reasoningEffort: nil),
+        sender: sender, client: client, message: message
+      )
+    }
+  }
+
+  /// Whether the text was meant as a row number that named nothing.
+  private func indexLike(_ target: String) -> Bool {
+    let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard let index = Int(trimmed) else { return false }
+    return index >= 1
+  }
+
+  /// The authenticated client plus the catalog, which every model command needs together.
+  private func modelContext() async throws -> (HarnessAPIClient, HarnessModelCatalog) {
+    let (client, capabilities) = try await harnessClient()
+    publish { $0.capabilities = capabilities }
+    return (client, try await client.modelCatalog())
+  }
+
+  /// The selection the bound session's next turn will use.
+  ///
+  /// Asked of the host rather than remembered locally: the same session can be retargeted from the
+  /// desktop window, and `/model` reporting a stale answer would be worse than reporting none. The
+  /// local memory only answers for the stretch before any session exists.
+  private func currentSelection(client: HarnessAPIClient, sender: String) async -> HarnessModelSelection? {
+    guard let sessionID = state.sessions[sender], !sessionID.isEmpty else {
+      return preferredSelections[sender]
+    }
+    let sessions = (try? await client.listSessions()) ?? []
+    if let row = sessions.first(where: { $0.id.rawValue == sessionID }), let selection = row.modelSelection {
+      return selection
+    }
+    return preferredSelections[sender]
+  }
+
+  /// Install a selection on the bound session, or remember it for the next new one.
+  private func install(
+    _ selection: HarnessModelSelection,
+    sender: String,
+    client: HarnessAPIClient,
+    message: WeChatInboundMessage
+  ) async {
+    preferredSelections[sender] = selection
+    guard let sessionID = state.sessions[sender], !sessionID.isEmpty else {
+      await reply(to: message, text: ChatReply.modelSelected(selection, bound: false))
+      return
+    }
+    do {
+      let applied = try await client.selectModel(
+        sessionID: sessionID,
+        provider: selection.provider,
+        model: selection.model,
+        reasoningEffort: selection.reasoningEffort
+      )
+      // The host's provider/model are authoritative — it may canonicalize what it was asked for —
+      // but an adapter is also free to answer a "no preference" request with the tier it resolved
+      // to, and remembering *that* would turn "默认" into a permanent choice for the next session.
+      let remembered = HarnessModelSelection(
+        provider: applied.provider,
+        model: applied.model,
+        reasoningEffort: selection.reasoningEffort == nil
+          ? nil
+          : (applied.reasoningEffort ?? selection.reasoningEffort)
+      )
+      preferredSelections[sender] = remembered
+      publish { $0.detail = "模型：\(remembered.displayName)" }
+      await reply(to: message, text: ChatReply.modelSelected(remembered, bound: true))
+    } catch {
+      await reply(to: message, text: modelSwitchFailure(error))
+    }
+  }
+
+  /// Resolve `/model`'s argument against the listing the user was shown, then the fresh catalog.
+  ///
+  /// The shown listing is preferred for exactly the reason `/use` prefers it: the catalog can
+  /// change between two reads (a provider that was down comes back), and the user pointed at a row.
+  static func resolveModel(
+    target: String,
+    shown: [HarnessModelChoice]?,
+    catalog: HarnessModelCatalog
+  ) -> HarnessModelChoice? {
+    let trimmed = target.trimmingCharacters(in: .whitespacesAndNewlines)
+    if let index = Int(trimmed), index >= 1 {
+      if let shown, index <= shown.count { return shown[index - 1] }
+      return index <= catalog.choices.count ? catalog.choices[index - 1] : nil
+    }
+    return catalog.choice(matching: trimmed)
+  }
+
+  /// Match a typed effort against a model's own tiers.
+  static func resolveEffort(_ target: String, choice: HarnessModelChoice) -> EffortResolution {
+    if ChatReply.isDefaultEffort(target) { return .providerDefault }
+    guard let tier = choice.effort(matching: target) else { return .unknown }
+    return .tier(tier.id)
+  }
+
   private func history(sender: String, turns: Int, message: WeChatInboundMessage) async {
     guard let binding = binding(for: sender) else {
       await reply(to: message, text: "还没有绑定会话。发送 /list 选一个，或直接发内容 + 触发词「开始」开一个新的。")
@@ -883,6 +1135,25 @@ public actor WeChatChannelService {
     (error as? HarnessAPIError)?.message ?? (error as? ILinkError)?.message ?? String(describing: error)
   }
 
+  /// A 404 is a host too old to have an endpoint — a different problem from a harness that is
+  /// down, and one the user can actually act on.
+  private func isMissingEndpoint(_ error: Error) -> Bool {
+    guard let api = error as? HarnessAPIError else { return false }
+    return api.code == .http && api.status == 404
+  }
+
+  private func modelCatalogFailure(_ error: Error) -> String {
+    isMissingEndpoint(error)
+      ? "这台 harness 没有模型目录（session/modelCatalog），升级 harness 后可用。"
+      : "读不到模型列表：\(describe(error))"
+  }
+
+  private func modelSwitchFailure(_ error: Error) -> String {
+    isMissingEndpoint(error)
+      ? "这台 harness 没有切换模型的接口（session/selectModel），升级 harness 后可用。"
+      : "切换失败：\(describe(error))"
+  }
+
   // MARK: - Submission
 
   private func submit(_ submission: BatchSubmission, from message: WeChatInboundMessage) async {
@@ -962,6 +1233,19 @@ public actor WeChatChannelService {
     }
   }
 
+  /// The channel's transport, created once and then reused.
+  ///
+  /// Reuse is the point, not an optimisation: one transport means one connection pool for the
+  /// whole run, instead of a pool per command whose connections outlive the call that made them.
+  /// It is never invalidated while the app runs — a later `/start` or re-bind has to keep talking
+  /// to the same harness — so the pool is deliberately as long-lived as the channel itself.
+  func harnessTransport() -> HarnessAPITransport {
+    if let sharedHarnessTransport { return sharedHarnessTransport }
+    let transport = makeHarnessTransport()
+    sharedHarnessTransport = transport
+    return transport
+  }
+
   private func harnessClient() async throws -> (HarnessAPIClient, HarnessCapabilities) {
     guard let url = await harnessURL() else {
       throw HarnessAPIError(code: .unauthorized, message: "harness 未运行")
@@ -1032,6 +1316,7 @@ public actor WeChatChannelService {
       let sessionID = try await client.createSession(cwd: workspace, agentPreset: config.agentPreset)
       state.sessions[sender] = sessionID
       persist()
+      await adoptPreferredSelection(sender: sender, sessionID: sessionID, client: client)
       return sessionID
     }
     if let existing = state.sessions[sender], !existing.isEmpty {
@@ -1054,6 +1339,7 @@ public actor WeChatChannelService {
         state.sessions[sender] = fresh
         persist()
         await titleSession(fresh, sender: sender, client: client)
+        await adoptPreferredSelection(sender: sender, sessionID: fresh, client: client)
         return fresh
       }
     }
@@ -1061,7 +1347,35 @@ public actor WeChatChannelService {
     state.sessions[sender] = sessionID
     persist()
     await titleSession(sessionID, sender: sender, client: client)
+    await adoptPreferredSelection(sender: sender, sessionID: sessionID, client: client)
     return sessionID
+  }
+
+  /// Install the selection this conversation asked for before its session existed.
+  ///
+  /// Deliberately confined to *freshly created* sessions. An existing session may have been
+  /// retargeted from the desktop window since the phone last spoke, and re-applying a remembered
+  /// choice on every use would silently undo that.
+  private func adoptPreferredSelection(sender: String, sessionID: String, client: HarnessAPIClient) async {
+    guard let preferred = preferredSelections[sender] else { return }
+    do {
+      let applied = try await client.selectModel(
+        sessionID: sessionID,
+        provider: preferred.provider,
+        model: preferred.model,
+        reasoningEffort: preferred.reasoningEffort
+      )
+      preferredSelections[sender] = HarnessModelSelection(
+        provider: applied.provider,
+        model: applied.model,
+        reasoningEffort: preferred.reasoningEffort
+      )
+      publish { $0.detail = "模型：\(applied.displayName)" }
+    } catch {
+      // Best effort by design: the turn still runs on the harness default, and a later `/model`
+      // repairs it. Failing the submission over a preference would be the worse trade.
+      publish { $0.detail = "模型设置失败：\(describe(error))" }
+    }
   }
 
   /// Give a freshly created channel session a recognizable name in the sidebar.
@@ -1147,10 +1461,10 @@ public actor WeChatChannelService {
       // A relay that refused to open has already published why; claiming it is on would
       // contradict the line the user is reading.
       if promptRelay != nil {
-        publish { $0.detail = "手机远控已开启：所有会话的审批与提问都会发到手机" }
+        publish { $0.detail = "手机远控已开启：所有会话的审批与提问都会发到手机，桌面会话的轮次结果与回复也会转发" }
       }
     } else {
-      publish { $0.detail = "手机远控已关闭：只有微信会话的审批与提问会转发" }
+      publish { $0.detail = "手机远控已关闭：不推送也不转发；只有微信会话自己的审批、提问与回复照旧" }
     }
     await refreshPendingPrompts()
   }
@@ -1204,10 +1518,146 @@ public actor WeChatChannelService {
           baseURL: credential.baseURL
         )
       } catch {
-        publish { $0.lastError = (error as? ILinkError)?.message ?? String(describing: error) }
+        let failure = error as? ILinkError
+        // The message now carries the provider's own `errmsg`, so a refused request says which
+        // parameter it disliked instead of only "ret -2". An expired session still has to change
+        // the badge: a push that cannot go out is what the user notices first.
+        publish {
+          $0.lastError = failure?.message ?? String(describing: error)
+          if failure?.code == .sessionExpired { $0.phase = .needsLogin }
+        }
         return
       }
     }
+  }
+
+  // MARK: - Information forwarding
+
+  /// Push one finished turn to the phone: what happened, and what it answered.
+  ///
+  /// Gated by the same switch as the approval push, because "手机远控" is one decision about what
+  /// the phone is for — being asked *and* being told. Reusing that flag rather than adding a second
+  /// one is the point: two switches would drift, and "远控开着却什么都收不到" is exactly the state a
+  /// user cannot diagnose from the phone.
+  ///
+  /// **Sessions this channel owns are skipped.** A WeChat-originated turn already has its answer
+  /// delivered into the conversation it came from, so forwarding it here would send the same text
+  /// twice. What this is *for* is the other case: a turn started at the desk, which the phone would
+  /// otherwise never hear about.
+  public func forwardTurnInfo(_ completion: TurnCompletion) async {
+    guard forwardsAllPrompts else { return }
+    // The switch can be on with nowhere to send: no bound bot, or an allowlist that excludes the
+    // owner. Saying so beats the silence a user cannot diagnose from the phone — and it is the one
+    // guard on this path that no other surface reports.
+    guard let sender = phonePromptAddress() else {
+      publish { $0.lastError = "手机远控已开启，但没有可发送的微信会话：先给机器人发一条消息，或在渠道窗口里确认绑定与允许的发送者。" }
+      return
+    }
+
+    let owner = owner(ofSession: completion.sessionID)
+    let adopted = owner.flatMap { state.adoptedSessions[$0]?.sessionID }
+    guard Self.shouldForward(
+      sessionID: completion.sessionID,
+      owner: owner,
+      adoptedSessionID: adopted
+    ) else { return }
+
+    await notify(sender: sender, text: Self.turnHeadline(completion))
+
+    // Best-effort, and deliberately not gated on the turn having succeeded: a failed turn can still
+    // hold the partial answer that explains it. No text means the headline was the whole message.
+    let reply = Self.bounded(
+      turnReplyText(for: completion) ?? "",
+      limit: Self.forwardedReplyLimit
+    )
+    if !reply.isEmpty {
+      await notify(sender: sender, text: reply)
+    }
+  }
+
+  /// Whether one session's finished turn should be forwarded, given who owns the conversation.
+  ///
+  /// Two kinds of ownership, and they answer differently:
+  ///
+  /// - **Created by this channel** (a trigger-phrase submission). The chat is that session's home, so
+  ///   its answer is already delivered into the conversation it came from — forwarding it again would
+  ///   send the same text twice, which is the visible bug this check exists to prevent.
+  /// - **Adopted from the phone** (`/use`). The chat only *borrowed* that session's approvals; the
+  ///   desk still owns its output and nothing pushes it to the chat, so it is forwarded. Treating the
+  ///   two the same would silently lose every result of a session the user took over.
+  ///
+  /// Pure so both answers are assertable without a bound bot or a live conversation.
+  public static func shouldForward(
+    sessionID: String,
+    owner: String?,
+    adoptedSessionID: String?
+  ) -> Bool {
+    guard owner != nil else { return true }
+    return adoptedSessionID == sessionID
+  }
+
+  /// How much of a forwarded answer is sent, in characters.
+  ///
+  /// A bound rather than the whole thing. This is a courtesy for a turn the user started at the desk,
+  /// so a long answer would otherwise arrive as a dozen consecutive messages on a phone — the failure
+  /// mode that gets a forwarding feature switched off. The headline already says the turn finished, so
+  /// the rest is one tap away in the app.
+  public static let forwardedReplyLimit = 600
+
+  /// A reply clipped for a phone, with a note that it was clipped.
+  ///
+  /// Pure, like the headline, so the bound and its wording are assertable without a bot.
+  public static func bounded(_ text: String, limit: Int) -> String {
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmed.count > limit else { return trimmed }
+    return String(trimmed.prefix(limit)) + "\n…（内容较长，完整内容在 app 里）"
+  }
+
+  /// The one-line "what just happened" — the shape a phone message is for.
+  ///
+  /// A pure function so the wording is assertable without a bot, a socket, or a log file.
+  public static func turnHeadline(_ completion: TurnCompletion) -> String {
+    let trimmed = completion.sessionTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let name = (trimmed?.isEmpty == false ? trimmed : nil) ?? completion.sessionID
+    let turn = completion.turn.map { "第 \($0) 轮" } ?? "本轮"
+    switch completion.kind {
+    case .completed:
+      return "✅ \(name) · \(turn)完成"
+    case .maxTokens:
+      return "⚠️ \(name) · \(turn)达到输出上限后停止"
+    case .blocked:
+      return "⛔️ \(name) · \(turn)被拒绝执行"
+    case .error:
+      return "❌ \(name) · \(turn)失败\(failureSuffix(completion))"
+    case .aborted:
+      return "🛑 \(name) · \(turn)已中断"
+    case .interrupted:
+      return "↩️ \(name) · \(turn)在恢复后被补记结束"
+    case .unknown:
+      return "ℹ️ \(name) · \(turn)结束（未识别的原因）"
+    }
+  }
+
+  /// `（code：message）` when the harness carried a structured failure, empty otherwise.
+  static func failureSuffix(_ completion: TurnCompletion) -> String {
+    let parts = [completion.failureCode, completion.failureMessage]
+      .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+      .filter { !$0.isEmpty }
+    guard !parts.isEmpty else { return "" }
+    return "（\(parts.joined(separator: "："))）"
+  }
+
+  /// What the finished turn answered, read from the session's own log.
+  ///
+  /// `nil` whenever the log cannot be located or the turn produced no text — all ordinary cases
+  /// (a workspace that moved, a turn that only ran tools), and none of which should stop the
+  /// headline from going out.
+  private func turnReplyText(for completion: TurnCompletion) -> String? {
+    guard let home = dshHome(), let cwd = completion.cwd, !cwd.isEmpty else { return nil }
+    guard let events = SessionLogLocator(dshHome: home)
+      .events(cwd: cwd, sessionID: completion.sessionID)
+    else { return nil }
+    return SessionReplyExtractor.turnReply(in: events, turn: completion.turn)
   }
 
   /// Attach every already-recorded conversation to the configured workspace.
@@ -1408,10 +1858,18 @@ public actor WeChatChannelService {
           baseURL: credential.baseURL
         )
       } catch {
-        let detail = (error as? ILinkError)?.message ?? String(describing: error)
+        let failure = error as? ILinkError
+        let detail = failure?.message ?? String(describing: error)
         state.lastError = detail
+        if failure?.code == .sessionExpired {
+          // Same protocol rule as the poll loop: the tokens belong to the session that ended.
+          state.contextTokens.removeAll()
+        }
         persist()
-        publish { $0.lastError = detail }
+        publish {
+          $0.lastError = detail
+          if failure?.code == .sessionExpired { $0.phase = .needsLogin }
+        }
         return
       }
     }
