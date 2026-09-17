@@ -9,8 +9,7 @@ between modules so that independent work composes without a merge step.
 Source of truth for *what the official runtime does*: `Spec/` (extracted fixtures) and
 `official-dsh/` (the official monorepo, read-only reference). This file is
 self-contained: the plan and the measurement record behind it are internal development
-documents, kept out of the published copy by `Tools/export-public.sh`, and nothing here
-points at them.
+documents that are kept out of the published copy, and nothing here points at them.
 
 ---
 

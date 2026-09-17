@@ -1,5 +1,5 @@
 {
-  "generatedBy": "Tools/extract-tool-catalog.mjs",
+  "generatedBy": "maintainer-side extraction from the official generated catalog",
   "source": "official-dsh/docs/tool-catalog.md",
   "note": "Model-visible tool schemas, booted from ctx.tools.schemas() by the official generator.",
   "packageMap": [

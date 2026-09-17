@@ -205,7 +205,7 @@ Sources/
   harnessctl/        命令行工具
   CZstd/             唯一链接 vendored libzstd 的地方
 Vendor/zstd/         随仓库附带的 libzstd 静态库
-Tools/               构建、安装、验证、导出、工程生成脚本
+Tools/               构建、安装、验证脚本 + 工程生成器
 Tests/               单元测试与 fixture
 Spec/                向上游对齐的请求头、工具 schema、会话事件 schema
 ```
