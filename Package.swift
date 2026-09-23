@@ -48,6 +48,8 @@ let package = Package(
     .library(name: "HarnessConsoleUI", targets: ["HarnessConsoleUI"]),
     // The app-owned native IM channel (provider protocol + batching + running-harness client).
     .library(name: "HarnessIM", targets: ["HarnessIM"]),
+    // The native mobile gateway: the `dsh-mobile-v1` WebSocket server a paired phone talks to.
+    .library(name: "HarnessMobileGateway", targets: ["HarnessMobileGateway"]),
     .executable(name: "harnessctl", targets: ["harnessctl"]),
   ],
   targets: [
@@ -127,6 +129,19 @@ let package = Package(
       swiftSettings: commonSwiftSettings
     ),
 
+    // MARK: - Native mobile gateway (the `dsh-mobile-v1` server)
+    //
+    // Sits beside HarnessIM rather than inside it: the IM channel is a client of the
+    // provider's API, while the gateway is a *server* for phones and a client of the
+    // running harness. Both need the same harness API client, so the gateway depends
+    // on HarnessIM and adds the listener, credentials and protocol on top.
+    .target(
+      name: "HarnessMobileGateway",
+      dependencies: ["HarnessKit", "HarnessIM"],
+      path: "Sources/HarnessMobileGateway",
+      swiftSettings: commonSwiftSettings
+    ),
+
     // MARK: - Headless driver (route B), used by the conformance suite
     .executableTarget(
       name: "harnessctl",
@@ -169,6 +184,14 @@ let package = Package(
       dependencies: ["HarnessIM"],
       path: "Tests/HarnessIMTests",
       resources: [.copy("Fixtures")],
+      swiftSettings: commonSwiftSettings
+    ),
+    // The gateway's wire codec, credential registry and upgrade decisions are all pure logic,
+    // so they are asserted without a socket, a harness or a home directory.
+    .testTarget(
+      name: "HarnessMobileGatewayTests",
+      dependencies: ["HarnessMobileGateway"],
+      path: "Tests/HarnessMobileGatewayTests",
       swiftSettings: commonSwiftSettings
     ),
     .testTarget(

@@ -24,8 +24,9 @@ versions, provisioning Node and managing plugins are all the app's job — open 
 - **Version management**: works across official versions, self-checks every upgrade, and can roll back to an older release whenever you need to fix something (next section)
 - **Multiple windows**: several views of the same harness, opened repeatedly with ⌥⌘N; only the main window can start or stop the server
 - **WeChat IM + phone remote control**: `/list`, `/use`, `/history`, `/say`, `/stop`, `/answer`, `/workspace`,
-  `/model`, `/effort`; with remote control on, approvals and questions go to WeChat, and each desktop turn forwards
-  its result plus the reply text
+  `/model`, `/effort`; switching remote control on first sends a connectivity self-check to WeChat, after
+  which approvals and questions go there, a running desktop turn streams its own text paragraphs in
+  throttled batches, and each turn end adds the result — text that already went out is not repeated
 - **Plugin management**: install / remove / import / repair profile plugins, with a compatibility verdict per plugin
 - **Safe start and recovery**: two levels of escape — drop the plugins first, then the whole home — plus a recovery window that can roll configuration back
 - **Local only**: everything lives under your own home directory; no telemetry, no account
@@ -46,9 +47,10 @@ versions, provisioning Node and managing plugins are all the app's job — open 
 
 ## How it differs from the other desktop clients
 
-The ecosystem already has two mature cross-platform desktop clients:
-[`dataelement/dsh-desktop`](https://github.com/dataelement/dsh-desktop) (Electron) and
-[`dsh-tauri/deepseek-harness-desktop`](https://github.com/dsh-tauri/deepseek-harness-desktop) (Tauri). They cover
+Cross-platform desktop clients already exist: the official monorepo ships `apps/desktop` as an Electron app
+(`@deepseek-ai/dsh-desktop`), and there are the independently released
+[`dataelement/dsh-desktop`](https://github.com/dataelement/dsh-desktop) plus the community Tauri build
+[`dsh-tauri/deepseek-harness-desktop`](https://github.com/dsh-tauri/deepseek-harness-desktop). They cover
 Windows / Linux and "download and run". This project is macOS-only, and its differences are ordered by how
 **verifiable** they are:
 
@@ -68,8 +70,8 @@ Windows / Linux and "download and run". This project is macOS-only, and its diff
 4. **Many windows, one harness**: every window is a view of the same server (shared address, no second server),
    and only the main window can start or stop it — no process with two owners
    (implementation: `Sources/HarnessUI/Shell/HarnessPageWindow.swift`).
-5. **Phone remote control out of the box**: the WeChat channel, approval push and per-turn forwarding are built-in
-   switches rather than a bridge plugin you install yourself (implementation:
+5. **Phone remote control out of the box**: the WeChat channel, approval push, live narration and per-turn
+   forwarding are built-in switches rather than a bridge plugin you install yourself (implementation:
    `Sources/HarnessIM/WeChatChannelService.swift`).
    ⚠️ The ecosystem already has several comparable WeChat plugins (at least eight), so this is **neither "first"
    nor "the only"**.
@@ -125,6 +127,22 @@ pass) is written into the report and shown in the UI.
 - **Note**: the self-check only runs on "Download and update" / "Update and restart". In the list, **Install**
   means "install and activate only — no restart, no checks", and **Activate** means "switch the version only — no
   restart, no checks".
+
+### 4. A real case: the 0.1.6-alpha.2 upgrade was blocked by an old plugin
+
+Updating from **0.1.6-alpha.1** to **0.1.6-alpha.2**, the harness did not come up and the error pointed at a plugin
+that failed to load under the new version. The plugin loader has no per-plugin isolation, so one unsupported plugin
+takes the whole boot down — and the interface you would use to disable it (the Web UI) is exactly what fails to open.
+
+The fix took two steps:
+
+1. **Harness → Plugin…** (⇧⌘P) in the menu bar opens the plugin list; turn the offending plugin **off**. That path
+   goes through the app's own disabled ledger and `cordis.patch.yml`, so it does not need the harness to be running.
+2. **Quit the app fully and reopen it** — the harness comes up normally and the other plugins still load.
+
+The takeaway: when an upgrade leaves the harness down, treat it as a plugin suspect first — disable that one plugin
+and restart, rather than reinstalling or rolling back in a hurry. The one-click equivalent is
+**Disable Broken Plugins and Retry** (⇧⌘R).
 
 ---
 

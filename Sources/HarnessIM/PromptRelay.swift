@@ -522,7 +522,7 @@ public actor PromptRelay {
       else { return nil }
       self.item = item
       self.approveLabel = approve
-      self.declineLabel = item.options.first { $0 != approve }
+      self.declineLabel = item.optionLabels.first { $0 != approve }
     }
 
     /// The verdict a printed option — its number or its label — names, if the reply used one.
@@ -530,8 +530,8 @@ public actor PromptRelay {
       let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !trimmed.isEmpty else { return nil }
       if let index = Int(trimmed) {
-        guard index >= 1, index <= item.options.count else { return nil }
-        return verdict(forLabel: item.options[index - 1])
+        guard index >= 1, index <= item.optionLabels.count else { return nil }
+        return verdict(forLabel: item.optionLabels[index - 1])
       }
       return verdict(forLabel: trimmed)
     }

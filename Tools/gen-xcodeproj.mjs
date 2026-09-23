@@ -120,7 +120,7 @@ const modules = [
     name: 'HarnessUI',
     kind: 'framework',
     sources: swiftSources(join(ROOT, 'Sources/HarnessUI')),
-    dependencies: ['HarnessKit', 'HarnessRuntime', 'HarnessIM'],
+    dependencies: ['HarnessKit', 'HarnessRuntime', 'HarnessIM', 'HarnessMobileGateway'],
   },
   {
     // The runtime/plugin console surface. Deliberately its own module rather than a
@@ -140,6 +140,15 @@ const modules = [
     kind: 'framework',
     sources: swiftSources(join(ROOT, 'Sources/HarnessIM')),
     dependencies: ['HarnessKit'],
+  },
+  {
+    // The native mobile gateway: the `dsh-mobile-v1` WebSocket server a paired phone
+    // talks to, plus the paired-device registry behind it. Depends on HarnessIM because
+    // it drives a running harness through the same API client the IM channel uses.
+    name: 'HarnessMobileGateway',
+    kind: 'framework',
+    sources: swiftSources(join(ROOT, 'Sources/HarnessMobileGateway')),
+    dependencies: ['HarnessKit', 'HarnessIM'],
   },
 ];
 
@@ -181,6 +190,12 @@ const testBundles = [
     sources: swiftSources(join(ROOT, 'Tests/HarnessIMTests')),
     dependencies: ['HarnessIM'],
     resources: [join(ROOT, 'Tests/HarnessIMTests/Fixtures')],
+  },
+  {
+    name: 'HarnessMobileGatewayTests',
+    sources: swiftSources(join(ROOT, 'Tests/HarnessMobileGatewayTests')),
+    dependencies: ['HarnessMobileGateway'],
+    resources: [],
   },
   {
     name: 'ConformanceTests',

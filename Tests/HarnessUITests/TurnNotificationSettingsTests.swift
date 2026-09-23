@@ -232,8 +232,12 @@ final class TurnNotificationSettingsTests: XCTestCase {
   /// a bot, or a socket.
   private actor RecordingPhoneForwarder: PhoneInfoForwarding {
     private(set) var forwarded: [TurnCompletion] = []
+    private(set) var narrated: [AssistantTextSegment] = []
     func forwardTurn(_ completion: TurnCompletion) async {
       forwarded.append(completion)
+    }
+    func forwardAssistantText(_ segment: AssistantTextSegment) async {
+      narrated.append(segment)
     }
   }
 

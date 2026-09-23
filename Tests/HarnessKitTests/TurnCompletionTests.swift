@@ -202,4 +202,81 @@ final class TurnCompletionTests: XCTestCase {
     XCTAssertFalse(TurnEndKind.aborted.isFailure)
     XCTAssertFalse(TurnEndKind.aborted.isCompletion)
   }
+
+  // MARK: - Running narration
+
+  /// The white text in the transcript, decoded from the event the harness commits for it.
+  ///
+  /// Plain text blocks only. The reasoning block is written *first* in a real step, so folding it in
+  /// would forward the model's thinking while the paragraph the user read stayed behind.
+  func testAssistantTextIsDecodedFromItsTextBlocks() throws {
+    let segment = try XCTUnwrap(AssistantTextSegment.decode(
+      sessionID: "session-1",
+      eventType: "assistant/message",
+      seq: 42,
+      data: try json("""
+      {"turn":4,"step":9,"message":{"id":"m1","role":"assistant","content":[
+        {"type":"reasoning","text":"让我先想一下"},
+        {"type":"text","text":"这个要分两步验证。"}
+      ]}}
+      """)
+    ))
+
+    XCTAssertEqual(segment.sessionID, "session-1")
+    XCTAssertEqual(segment.text, "这个要分两步验证。")
+    XCTAssertEqual(segment.turn, 4)
+    XCTAssertEqual(segment.step, 9)
+    XCTAssertEqual(segment.seq, 42)
+    // The title and the subagent flag are the caller's, not the event's: only the caller holds the
+    // session list they come from.
+    XCTAssertNil(segment.sessionTitle)
+    XCTAssertFalse(segment.isSubagent)
+  }
+
+  /// Several text blocks in one step are one paragraph, in the order the model wrote them.
+  func testSeveralTextBlocksBecomeOneParagraph() throws {
+    let segment = try XCTUnwrap(AssistantTextSegment.decode(
+      sessionID: "session-1",
+      eventType: "assistant/message",
+      data: try json(#"{"message":{"content":[{"type":"text","text":"前半句，"},{"type":"text","text":"后半句。"}]}}"#)
+    ))
+    XCTAssertEqual(segment.text, "前半句，后半句。")
+  }
+
+  /// Most steps are tool calls with no text at all, and an empty paragraph is not worth a phone
+  /// message — `nil` here is the ordinary case, not a failure.
+  func testStepsWithoutTextAreNotSegments() throws {
+    XCTAssertNil(AssistantTextSegment.decode(
+      sessionID: "session-1",
+      eventType: "assistant/message",
+      data: try json(#"{"turn":1,"step":2,"message":{"content":[{"type":"tool_use","id":"t","name":"Bash","input":{}}]}}"#)
+    ))
+    // Whitespace is not text either: a step that emitted only a newline would otherwise reach a
+    // phone as an empty message.
+    XCTAssertNil(AssistantTextSegment.decode(
+      sessionID: "session-1",
+      eventType: "assistant/message",
+      data: try json(#"{"message":{"content":[{"type":"text","text":"   \n "}]}}"#)
+    ))
+    XCTAssertNil(AssistantTextSegment.decode(
+      sessionID: "session-1",
+      eventType: "assistant/message",
+      data: try json(#"{"turn":1}"#)
+    ))
+  }
+
+  /// Only the one event type is narration. A `user/message` quoting the same shapes is not, and
+  /// neither is the process-local chunk stream.
+  func testOtherEventTypesAreNotNarration() throws {
+    XCTAssertNil(AssistantTextSegment.decode(
+      sessionID: "session-1",
+      eventType: "user/message",
+      data: try json(#"{"message":{"content":[{"type":"text","text":"我写的话"}]}}"#)
+    ))
+    XCTAssertNil(AssistantTextSegment.decode(
+      sessionID: "session-1",
+      eventType: "assistant/chunk",
+      data: try json(#"{"message":{"content":[{"type":"text","text":"流式片段"}]}}"#)
+    ))
+  }
 }

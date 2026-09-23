@@ -24,7 +24,8 @@
 - **版本管理**：兼容官方各版本，更新后自检，随时可回退到旧版本修错（见下节）
 - **多窗口**：同一个 harness 的多个视图，⌥⌘N 可反复开；只有主窗口能启停服务器
 - **微信 IM + 手机远控**：`/list`、`/use`、`/history`、`/say`、`/stop`、`/answer`、`/workspace`、
-  `/model`、`/effort`；开启远控后审批与提问推到微信，桌面会话每轮结束把结果与回复正文一起转发
+  `/model`、`/effort`；开启远控时先往微信发一条连通性自检，随后审批与提问推到微信，桌面会话在跑的过程中把
+  每步正文（界面里那些白色中文段落）按节流批量转发，每轮结束再补一条结果；发过的正文不会在轮末重复
 - **插件管理**：安装 / 卸载 / 导入 / 修复 profile 插件，并给出兼容性结论
 - **安全启动与恢复**：先摘插件、再摘整个 home 的两级退路，外加一个可回滚配置的恢复窗口
 - **纯本地**：所有数据都在你自己的用户目录下，没有遥测、没有账号
@@ -45,9 +46,10 @@
 
 ## 和其他桌面端比，差异在哪
 
-同生态里已经有两个成熟的跨平台桌面端：[`dataelement/dsh-desktop`](https://github.com/dataelement/dsh-desktop)（Electron）
-和 [`dsh-tauri/deepseek-harness-desktop`](https://github.com/dsh-tauri/deepseek-harness-desktop)（Tauri）——它们覆盖
-Windows / Linux 与"下载即用"。本项目只做 macOS，差异按**可信度**排序：
+跨平台桌面端已经有现成的选择：官方 monorepo 的 `apps/desktop` 就是 Electron 实现（`@deepseek-ai/dsh-desktop`），
+另有独立发行的 [`dataelement/dsh-desktop`](https://github.com/dataelement/dsh-desktop) 与社区 Tauri 版
+[`dsh-tauri/deepseek-harness-desktop`](https://github.com/dsh-tauri/deepseek-harness-desktop)。它们覆盖
+Windows / Linux 与「下载即用」。本项目只做 macOS，差异按**可信度**排序：
 
 1. **版本可靠性**：多版本并存；升级后跑 8 项自检（`boot`、`rpc-endpoints` 是阻断项）；阻断项没过就
    **只回退一次**、不循环；正在当回退目标的版本不允许删除；升级中途崩溃，下次启动继续判定。
@@ -61,7 +63,7 @@ Windows / Linux 与"下载即用"。本项目只做 macOS，差异按**可信度
    （实现见 `Sources/HarnessRuntime/SafeBoot.swift`、`Sources/HarnessRuntime/ProfileCheckpoint.swift`）。
 4. **多窗口看同一个 harness**：多个窗口都是同一个 server 的视图（共享地址，不新起服务），
    只有主窗口能启停——不会出现一个进程两个主人（实现见 `Sources/HarnessUI/Shell/HarnessPageWindow.swift`）。
-5. **手机远控开箱即用**：微信通道、审批推送、轮次转发是内置开关，不用自己装桥接插件
+5. **手机远控开箱即用**：微信通道、审批推送、过程正文与轮次转发是内置开关，不用自己装桥接插件
    （实现见 `Sources/HarnessIM/WeChatChannelService.swift`）。
    ⚠️ 生态里同类微信插件已经有好几个（至少 8 个），这一条**不是"首个"也不是"唯一"**。
 
@@ -110,6 +112,20 @@ Windows / Linux 与"下载即用"。本项目只做 macOS，差异按**可信度
 - **回退目标受保护**：正被当作回退目标的 release 不允许删除，避免出现"没有退路"的状态。
 - **注意**：自检只挂在「下载并更新 / 更新并重启」上；列表里的 **Install** 是"只安装并激活，不重启、不检查"，
   **Activate** 是"只切换版本，不重启、不检查"。
+
+### 四、一个实际案例：升到 0.1.6-alpha.2 时被旧插件拦住
+
+从 **0.1.6-alpha.1** 更新到 **0.1.6-alpha.2** 时，harness 没有起来，报的是插件相关的错——某个插件在新版本下加载
+失败。插件加载器没有逐插件隔离，一个不支持的插件就能把整次启动带下去，而平时关它的界面（Web UI）正好打不开。
+
+实际处理只用了两步：
+
+1. 菜单栏 **Harness → Plugin…**（⇧⌘P）打开插件管理列表，把报错的那个插件**关闭**。这一步走的是 App 自己写的
+   禁用清单与 `cordis.patch.yml`，不需要 harness 已经起来；
+2. **完全退出 App 再重新打开**，harness 正常打开，其余插件照常加载。
+
+结论：升级后起不来，先按"插件嫌疑"处理——关掉那个插件再重启一次，比急着重装或退回旧版本省事。
+界面上的等价一键入口是 **Disable Broken Plugins and Retry**（⇧⌘R）。
 
 ---
 

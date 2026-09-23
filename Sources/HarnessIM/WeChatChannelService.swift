@@ -89,6 +89,7 @@ public actor WeChatChannelService {
   private let dshHome: DSHHomeProvider
   private let client: ILinkClient
   private let replyConfiguration: SessionReplySource.Configuration
+  private let narrationConfiguration: NarrationConfiguration
   private let makeHarnessTransport: HarnessTransportFactory
   private let replySourceFactory: ReplySourceFactory
   private let approvalStreamFactory: ApprovalStreamFactory
@@ -158,6 +159,7 @@ public actor WeChatChannelService {
     dshHome: @escaping DSHHomeProvider,
     client: ILinkClient = ILinkClient(),
     replyConfiguration: SessionReplySource.Configuration = .init(),
+    narrationConfiguration: NarrationConfiguration = .init(),
     harnessTransport: @escaping HarnessTransportFactory = { URLSessionHarnessTransport() },
     replySourceFactory: @escaping ReplySourceFactory = { home, cwd, sessionID in
       SessionReplySource(dshHome: home, cwd: cwd, sessionID: sessionID, client: nil)
@@ -171,6 +173,7 @@ public actor WeChatChannelService {
     self.dshHome = dshHome
     self.client = client
     self.replyConfiguration = replyConfiguration
+    self.narrationConfiguration = narrationConfiguration
     self.makeHarnessTransport = harnessTransport
     self.replySourceFactory = replySourceFactory
     self.approvalStreamFactory = approvalStreamFactory
@@ -281,6 +284,7 @@ public actor WeChatChannelService {
     credential = nil
     // There is no phone to answer from without a bound bot, so the switch cannot stay on.
     forwardsAllPrompts = false
+    resetNarrations()
     store.clearCredential()
     publish {
       $0.phase = .needsLogin
@@ -1461,15 +1465,72 @@ public actor WeChatChannelService {
       // A relay that refused to open has already published why; claiming it is on would
       // contradict the line the user is reading.
       if promptRelay != nil {
-        publish { $0.detail = "手机远控已开启：所有会话的审批与提问都会发到手机，桌面会话的轮次结果与回复也会转发" }
+        publish { $0.detail = "手机远控已开启：所有会话的审批、提问与过程正文都会发到手机，桌面会话的轮次结果与回复也会转发" }
       }
     } else {
+      // Narration is buffered in this actor, so switching off has to drop what is still waiting:
+      // a paragraph that was collected while the switch was on is not a reason to keep sending.
+      resetNarrations()
       publish { $0.detail = "手机远控已关闭：不推送也不转发；只有微信会话自己的审批、提问与回复照旧" }
     }
+    // The switch itself is published before the self-check below, so the button flips on the user's
+    // click: a provider round trip (up to its timeout) must not look like a dead button.
     await refreshPendingPrompts()
+
+    // …and then prove the sending half works, on the user's own action, while they are still looking
+    // at the window. Runs whether or not the relay opened: the relay carries approvals *from* the
+    // harness, this tests the bot *to* the phone, and the two fail independently.
+    if on { await probePhoneLink() }
   }
 
   public func currentForwardsAllPrompts() -> Bool { forwardsAllPrompts }
+
+  /// What the phone receives the moment the switch goes on.
+  ///
+  /// Phrased as "if you can read this, the link works" rather than as "connectivity is fine": the
+  /// sender learns that the provider accepted the request, not that a human saw it, and a check that
+  /// claims more than it can know is worth less than one the user confirms by looking at their phone.
+  ///
+  /// Pure, like the other message wording here, so what the self-check says is assertable without a
+  /// bot or a socket.
+  public static var phoneLinkProbeText: String {
+    """
+    📱 手机远控已开启（连通性自检）
+    看到这条消息，说明发往手机的通道是通的 —— 之后所有会话的审批、提问，以及桌面会话每一轮的正文与结果都会发到这里。
+    这条自检不需要回复。
+    """
+  }
+
+  /// Send the self-check, and report what happened where the user is looking.
+  ///
+  /// Every other message this channel sends is triggered by something invisible from the phone — an
+  /// approval, a question, a turn ending — so "远控开着却什么都收不到" has no diagnosis from WeChat
+  /// itself. This one is triggered by the user's own action on the desktop, which makes it the only
+  /// message that can say something about the *link* rather than about a session.
+  ///
+  /// A failure is reported through the same `lastError` the provider loop uses, so the window says
+  /// why rather than leaving the switch looking healthy. The switch is deliberately *not* turned back
+  /// off: the user asked for it, and a probe that silently flips it would hide the reason they turned
+  /// it on.
+  func probePhoneLink() async {
+    guard let sender = phonePromptAddress() else {
+      publish {
+        $0.lastError = "手机远控已开启，但没有可发送的微信会话：先给机器人发一条消息，或在渠道窗口里确认绑定与允许的发送者。"
+      }
+      return
+    }
+
+    let delivered = await notify(sender: sender, text: Self.phoneLinkProbeText)
+    publish {
+      if delivered {
+        $0.detail = "手机远控已开启：连通性自检已送达手机；审批、提问与桌面会话的过程正文都会发过去"
+        // A send that just worked is the strongest evidence there is that an older error is over.
+        $0.lastError = nil
+      } else {
+        $0.detail = "手机远控已开启，但连通性自检没能送达：先给机器人发一条消息（微信里直接发一句再重开开关），错误原因见下"
+      }
+    }
+  }
 
   /// Republish how many questions the phone is still holding an answer for.
   func refreshPendingPrompts() async {
@@ -1505,9 +1566,14 @@ public actor WeChatChannelService {
     state.sessions.first { $0.value == sessionID }?.key
   }
 
-  /// Send a message to a sender outside a reply context (approval questions).
-  func notify(sender: String, text: String) async {
-    guard let credential else { return }
+  /// Send a message to a sender outside a reply context (approval questions, forwardings).
+  ///
+  /// - Returns: whether every chunk reached the provider. The narration buffer needs the answer — it
+  ///   re-queues text a failed send would otherwise lose — while the approval path deliberately
+  ///   ignores it and lets the published error speak.
+  @discardableResult
+  func notify(sender: String, text: String) async -> Bool {
+    guard let credential else { return false }
     for chunk in WeChatMessageParser.splitText(text, maxCharacters: config.replyChunkCharacters) {
       do {
         try await client.sendText(
@@ -1526,9 +1592,10 @@ public actor WeChatChannelService {
           $0.lastError = failure?.message ?? String(describing: error)
           if failure?.code == .sessionExpired { $0.phase = .needsLogin }
         }
-        return
+        return false
       }
     }
+    return true
   }
 
   // MARK: - Information forwarding
@@ -1562,17 +1629,29 @@ public actor WeChatChannelService {
       adoptedSessionID: adopted
     ) else { return }
 
+    // The narration this turn collected goes out first, and *before* the headline: the phone should
+    // read the running commentary, then "it finished", then whatever the answer added to it.
+    let key = NarrationKey(sessionID: completion.sessionID, turn: completion.turn)
+    await flushNarration(key, sender: sender)
+    let narrated = narrations[key]?.lastSentParagraph
+
     await notify(sender: sender, text: Self.turnHeadline(completion))
 
     // Best-effort, and deliberately not gated on the turn having succeeded: a failed turn can still
     // hold the partial answer that explains it. No text means the headline was the whole message.
-    let reply = Self.bounded(
-      turnReplyText(for: completion) ?? "",
-      limit: Self.forwardedReplyLimit
-    )
-    if !reply.isEmpty {
-      await notify(sender: sender, text: reply)
+    let answer = (turnReplyText(for: completion) ?? "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    // A turn's answer *is* its last paragraph, and narration forwards every paragraph as it is
+    // written — so without this the same text would arrive twice, once as narration and again under
+    // the headline. Compared before `bounded`, because the clip marker would make two identical
+    // answers look different.
+    if !answer.isEmpty, answer != narrated {
+      await notify(sender: sender, text: Self.bounded(answer, limit: Self.forwardedReplyLimit))
     }
+
+    // Nothing more will be narrated for this turn; dropping it is what keeps a long session from
+    // accumulating one record per turn forever.
+    finishNarration(key)
   }
 
   /// Whether one session's finished turn should be forwarded, given who owns the conversation.
@@ -1658,6 +1737,166 @@ public actor WeChatChannelService {
       .events(cwd: cwd, sessionID: completion.sessionID)
     else { return nil }
     return SessionReplyExtractor.turnReply(in: events, turn: completion.turn)
+  }
+
+  // MARK: - Live narration
+
+  /// How long one batch of narration waits for company before it is sent, in seconds.
+  ///
+  /// The turn this exists for is not one paragraph. A measured desktop session produced 30 text
+  /// paragraphs across 108 steps, so one message per paragraph is the failure mode that gets a
+  /// forwarding feature switched off — the same argument `forwardedReplyLimit` makes, one level
+  /// down. A batch therefore collects for a few seconds and leaves as one message.
+  public static let narrationInterval: TimeInterval = 5
+
+  /// How much narration goes into one message before it is sent without waiting for the interval.
+  ///
+  /// The other half of the same bound: a turn that narrates faster than the interval must not
+  /// produce an arbitrarily long message. Reaching this flushes immediately.
+  public static let narrationBatchLimit = 400
+
+  /// The two bounds above, injectable so a test does not have to sit through five real seconds.
+  public struct NarrationConfiguration: Sendable {
+    public var interval: TimeInterval
+    public var batchLimit: Int
+
+    public init(
+      interval: TimeInterval = WeChatChannelService.narrationInterval,
+      batchLimit: Int = WeChatChannelService.narrationBatchLimit
+    ) {
+      self.interval = interval
+      self.batchLimit = batchLimit
+    }
+  }
+
+  /// The line that says which conversation and which turn a paragraph belongs to.
+  ///
+  /// Repeated on every batch rather than only the first, because the phone hears from every followed
+  /// session: two conversations narrating at once would otherwise arrive as unattributed paragraphs.
+  /// Pure, like `turnHeadline`, so the wording is assertable without a bot.
+  public static func narrationHeadline(
+    sessionTitle: String?,
+    sessionID: String,
+    turn: Int?
+  ) -> String {
+    let trimmed = sessionTitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let name = (trimmed?.isEmpty == false ? trimmed : nil) ?? sessionID
+    let turnLabel = turn.map { "第 \($0) 轮" } ?? "本轮"
+    return "📝 \(name) · \(turnLabel)"
+  }
+
+  /// What has been said to the phone about one running turn.
+  private struct Narration {
+    var title: String?
+    /// Paragraphs collected since the last send, in the order the model wrote them.
+    var pending: [String] = []
+    /// The last paragraph the provider accepted. A turn's answer is its own last paragraph, so this
+    /// one string is the whole test for "did the phone already get it" — see `forwardTurnInfo`.
+    var lastSentParagraph: String?
+    /// Whether a flush is already scheduled. One timer per turn, not one per paragraph.
+    var scheduled = false
+
+    var body: String { pending.joined(separator: "\n\n") }
+  }
+
+  /// The turn a batch of narration belongs to. A turn number is part of the identity so two turns
+  /// of one session never share a buffer, and `nil` is its own key rather than a wildcard.
+  private struct NarrationKey: Hashable {
+    var sessionID: String
+    var turn: Int?
+  }
+
+  private var narrations: [NarrationKey: Narration] = [:]
+  private var narrationFlushes: [NarrationKey: Task<Void, Never>] = [:]
+
+  /// Push one paragraph of a running turn's text to the phone.
+  ///
+  /// Gated exactly like `forwardTurnInfo` — the same switch, the same ownership rule, the same
+  /// "is there an address to send to" — because both answer one question: what does the phone hear
+  /// about a turn started at the desk. Only the volume differs: paragraphs are batched, and the last
+  /// one sent is remembered so the turn's answer is not delivered twice.
+  ///
+  /// The missing-address case is deliberately *not* reported here. `forwardTurnInfo` reports it once
+  /// at the end of the same turn, and repeating it per paragraph would turn one diagnosis into a
+  /// stream of identical lines.
+  public func forwardAssistantText(_ segment: AssistantTextSegment) async {
+    guard forwardsAllPrompts else { return }
+    guard let sender = phonePromptAddress() else { return }
+    let owner = owner(ofSession: segment.sessionID)
+    let adopted = owner.flatMap { state.adoptedSessions[$0]?.sessionID }
+    guard Self.shouldForward(
+      sessionID: segment.sessionID,
+      owner: owner,
+      adoptedSessionID: adopted
+    ) else { return }
+
+    let key = NarrationKey(sessionID: segment.sessionID, turn: segment.turn)
+    var narration = narrations[key] ?? Narration()
+    narration.title = segment.sessionTitle ?? narration.title
+    narration.pending.append(segment.text)
+    narrations[key] = narration
+
+    if narration.body.count >= narrationConfiguration.batchLimit {
+      await flushNarration(key, sender: sender)
+      return
+    }
+    scheduleNarrationFlush(key)
+  }
+
+  /// Send what has accumulated for one turn, if anything has.
+  private func flushNarration(_ key: NarrationKey, sender: String? = nil) async {
+    narrationFlushes[key] = nil
+    guard var narration = narrations[key], !narration.pending.isEmpty else { return }
+    narration.scheduled = false
+    let paragraphs = narration.pending
+    let body = narration.body
+    // Cleared before the send, so a paragraph that arrives while the provider is being talked to
+    // starts the next batch instead of being wiped by this one finishing.
+    narration.pending = []
+    narrations[key] = narration
+
+    guard let to = sender ?? phonePromptAddress() else {
+      narrations[key]?.pending.insert(contentsOf: paragraphs, at: 0)
+      return
+    }
+    let text = Self.narrationHeadline(
+      sessionTitle: narration.title,
+      sessionID: key.sessionID,
+      turn: key.turn
+    ) + "\n" + body
+    if await notify(sender: to, text: text) {
+      narrations[key]?.lastSentParagraph = paragraphs.last
+    } else {
+      // A refused send must not eat the paragraph: it goes back to the front of the queue, and the
+      // turn ending flushes it again. `lastSentParagraph` stays as it was, so the answer that failed
+      // to go out is still forwarded under the headline.
+      narrations[key]?.pending.insert(contentsOf: paragraphs, at: 0)
+    }
+  }
+
+  /// Arrange for one turn's buffer to be sent once it has had `narrationInterval` to fill.
+  private func scheduleNarrationFlush(_ key: NarrationKey) {
+    guard narrations[key]?.scheduled != true else { return }
+    narrations[key]?.scheduled = true
+    narrationFlushes[key] = Task { [weak self] in
+      try? await Task.sleep(nanoseconds: UInt64(narrationConfiguration.interval * 1_000_000_000))
+      guard !Task.isCancelled else { return }
+      await self?.flushNarration(key)
+    }
+  }
+
+  /// Forget a finished turn's narration, and stop any timer still pointed at it.
+  private func finishNarration(_ key: NarrationKey) {
+    narrationFlushes[key]?.cancel()
+    narrationFlushes[key] = nil
+    narrations[key] = nil
+  }
+
+  /// Drop every turn's narration. The switch going off, or the bot being disconnected.
+  private func resetNarrations() {
+    for task in narrationFlushes.values { task.cancel() }
+    narrationFlushes.removeAll()
+    narrations.removeAll()
   }
 
   /// Attach every already-recorded conversation to the configured workspace.

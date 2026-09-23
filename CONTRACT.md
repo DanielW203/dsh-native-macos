@@ -101,6 +101,17 @@ because each is a thin layer over a service that already exists:
     ~160 KB/s of loopback traffic (2.3 GB in a few hours) while its log grew 25 B/s.
   The forwarded text is the turn's plain text blocks only — never its reasoning, which the harness
   writes first — and the session's `cwd`, carried on the watch target, is what locates the log.
+  The same subscription also carries the *running* narration: every `assistant/message` a turn commits
+  becomes an `AssistantTextSegment` and is forwarded as it is written, because the ending alone can
+  only ever carry the turn's **last** paragraph. Volume is bounded twice over —
+  `WeChatChannelService.narrationInterval` (5 s of collection) and `narrationBatchLimit` (400 chars,
+  flushed immediately) — and the last paragraph sent is remembered, so a turn's answer, which *is* its
+  last paragraph, is not delivered a second time under the headline.
+  `WeChatChannelService.probePhoneLink` is the one message triggered by the user's own action rather
+  than by a session: switching 手机远控 on sends a self-check, because every other message on this path
+  is caused by something invisible from the phone, which makes a broken link and a quiet session look
+  identical from WeChat. Its wording is phrased as "seeing this means the link works" — the sender
+  learns the provider accepted the request, not that a human read it.
 - **Session archives** (`Sources/HarnessRuntime/SessionArchive.swift`, UI in
   `Sources/HarnessUI/Backup/`). Export reads `$DSH_HOME/sessions` + `attachments` and writes
   one zip through `ditto`; import validates through `ArchiveInspector` before extracting, and

@@ -229,7 +229,8 @@ public final class WeChatChannelModel: ObservableObject {
       var text = """
       手机远控已开启，两件事同时生效：
       · 审批与提问：任何会话需要你批准或回答时都会发到微信，直接回「批准」/「拒绝」，或按提示 /answer 作答。桌面弹窗仍然可用，先答的先生效。
-      · 信息转发：桌面会话每轮结束时把结果发过来（✅ 完成 / ⚠️ 上限 / ❌ 失败），并把这一轮回复的正文一起转发；来自微信的会话不重复转发。
+      · 信息转发：桌面会话在跑的过程中把每一步的正文按节流批量发过来，每轮结束再补一条结果（✅ 完成 / ⚠️ 上限 / ❌ 失败）；正文发过就不再重复，来自微信的会话也不重复转发。
+      开启时已往微信发过一条连通性自检：收到即说明通道正常，没收到就看下面的错误原因。
       \(commands)
       点击关闭。
       """
@@ -239,7 +240,7 @@ public final class WeChatChannelModel: ObservableObject {
     return """
     手机远控已关闭：桌面会话的审批、提问与轮次信息都留在 app 里；来自微信的会话仍会照旧在微信里收发。
     \(commands)
-    点击开启后，审批与提问会推到手机，桌面会话每轮的结果与回复也会转发过来。
+    点击开启后会先往微信发一条连通性自检，随后审批与提问会推到手机，桌面会话的过程正文与每轮结果也会转发过来。
     """
   }
 
@@ -536,6 +537,14 @@ extension WeChatChannelModel: PhoneInfoForwarding {
   /// answers, and the one in the model would be the one that cannot see the credential.
   public func forwardTurn(_ completion: TurnCompletion) async {
     await service.forwardTurnInfo(completion)
+  }
+
+  /// Forward one paragraph of a running turn to the phone.
+  ///
+  /// A pass-through for the same reason as `forwardTurn`: the batching, the switch, and the
+  /// ownership rule are the service's, because it is the only object that can see the credential.
+  public func forwardAssistantText(_ segment: AssistantTextSegment) async {
+    await service.forwardAssistantText(segment)
   }
 }
 

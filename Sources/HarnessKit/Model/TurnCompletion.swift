@@ -45,6 +45,82 @@ public struct SessionFollowRecord: Sendable, Equatable {
   }
 }
 
+/// One paragraph of plain assistant text, published while its turn is still running.
+///
+/// The transcript's own unit, not a summary of it. `assistant/message` is committed once per model
+/// step, so a turn that narrates between tool calls ("先给 C 层加进程枚举…") and then answers
+/// produces one of these per step that had something to say — which is exactly the white text the
+/// GUI shows, and the reason this exists separately from `TurnCompletion`: a watcher that only
+/// looked at endings could only ever forward the *last* paragraph.
+///
+/// **Text blocks only, and reasoning is not text.** `ContentBlock.text` joins the plain `text`
+/// blocks and drops `reasoning`; folding reasoning in would push the model's thinking to a phone
+/// while the answer stayed behind, which is the same trap `SessionReplyExtractor` documents.
+///
+/// The segment is a value, not a claim about the log: it carries the cursor it was seen at, so a
+/// forwarder can tell a replayed frame from a live one, and the session's display name so a message
+/// on a phone can say which conversation it belongs to without a second lookup.
+public struct AssistantTextSegment: Sendable, Equatable {
+  public var sessionID: String
+  /// The session's display name at the moment the frame arrived, when the caller knows it.
+  public var sessionTitle: String?
+  /// Whether the text came from a subagent's session. Carried so a forwarder can apply the same
+  /// quiet-by-default rule it applies to a subagent's endings.
+  public var isSubagent: Bool
+  public var turn: Int?
+  public var step: Int?
+  /// The durable sequence of the `assistant/message` event this was read from, when there is one.
+  public var seq: Int?
+  public var text: String
+
+  public init(
+    sessionID: String,
+    sessionTitle: String? = nil,
+    isSubagent: Bool = false,
+    turn: Int? = nil,
+    step: Int? = nil,
+    seq: Int? = nil,
+    text: String
+  ) {
+    self.sessionID = sessionID
+    self.sessionTitle = sessionTitle
+    self.isSubagent = isSubagent
+    self.turn = turn
+    self.step = step
+    self.seq = seq
+    self.text = text
+  }
+
+  /// Decode one durable session event, or `nil` when it is not assistant text worth forwarding.
+  ///
+  /// Total and forward-compatible, like the rest of this file: a step that only called tools has an
+  /// `assistant/message` with no text blocks, and that is an ordinary `nil` rather than an error —
+  /// it is most steps. The text is trimmed here, once, so every consumer compares the same string:
+  /// the turn-end reply this is deduplicated against comes from the same blocks.
+  public static func decode(
+    sessionID: String,
+    eventType: String,
+    seq: Int? = nil,
+    data: JSONValue
+  ) -> AssistantTextSegment? {
+    guard eventType == EventType.assistantMessage.rawValue else { return nil }
+    let blocks = (data.path("message.content")?.arrayValue ?? []).map(ContentBlock.init(json:))
+    let text = blocks.compactMap { block -> String? in
+      if case .text(let value) = block { return value }
+      return nil
+    }.joined()
+    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return nil }
+    return AssistantTextSegment(
+      sessionID: sessionID,
+      turn: data.int(at: "turn"),
+      step: data.int(at: "step"),
+      seq: seq,
+      text: trimmed
+    )
+  }
+}
+
 public enum SessionFollowFrame: Sendable, Equatable {
   /// The opening frame. `cursor` is the log cut the snapshot was taken at, so a reader can page
   /// history with `session/page` without racing the live stream. `records` is that cut's own page of

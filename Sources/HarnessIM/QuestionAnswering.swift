@@ -34,9 +34,18 @@ public struct QuestionItem: Sendable, Equatable, Identifiable {
   public var header: String?
   public var question: String
   public var detail: String?
-  /// Option labels in the order the host declared them. The order is the protocol: `/answer 2`
-  /// means the second label, so it is preserved verbatim.
-  public var options: [String]
+  /// The choices, in the order the host declared them, each with the line that explains it.
+  ///
+  /// The order is the protocol: `/answer 2` means the second one, so it is preserved verbatim.
+  /// `HarnessKit.UserQuestion.Option` rather than a second definition of the same pair: the desktop
+  /// sheet already renders that `description` under that `label`, and a phone message that dropped
+  /// it asked the user to choose between bare labels.
+  public var options: [UserQuestion.Option]
+  /// The labels alone — what `/answer 2` matches against and what the host is sent back.
+  ///
+  /// Derived, never stored beside `options`: two arrays of the same length are a bug waiting for the
+  /// first entry to be filtered out.
+  public var optionLabels: [String] { options.map(\.label) }
   public var multiSelect: Bool
   /// Set when the asker declared a plan review: this option approves the plan and every other
   /// option declines it. Named, never positional — the host rejects an approval naming nothing.
@@ -47,7 +56,7 @@ public struct QuestionItem: Sendable, Equatable, Identifiable {
     header: String? = nil,
     question: String,
     detail: String? = nil,
-    options: [String] = [],
+    options: [UserQuestion.Option] = [],
     multiSelect: Bool = false,
     approveLabel: String? = nil
   ) {
@@ -69,7 +78,17 @@ public struct QuestionItem: Sendable, Equatable, Identifiable {
     self.header = json["header"]?.stringValue
     self.question = question
     self.detail = json["detail"]?.stringValue
-    self.options = (json["options"]?.arrayValue ?? []).compactMap { $0["label"]?.stringValue }
+    // An option the host left unexplained is an ordinary option, not a malformed one: the schema
+    // makes `description` optional, and most choices do not carry one.
+    self.options = (json["options"]?.arrayValue ?? []).compactMap { value in
+      guard let label = value["label"]?.stringValue else { return nil }
+      let description = value["description"]?.stringValue?
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+      return UserQuestion.Option(
+        label: label,
+        description: (description?.isEmpty == false ? description : nil)
+      )
+    }
     self.multiSelect = json["multiSelect"]?.boolValue ?? false
     self.approveLabel = json.path("intent.kind")?.stringValue == "plan-review"
       ? json.path("intent.approve")?.stringValue
@@ -131,7 +150,15 @@ public enum QuestionPrompt {
         lines.append("   \(RemoteSessionHistory.clip(detail, to: limit))")
       }
       for (index, option) in item.options.enumerated() {
-        lines.append("   \(index + 1)) \(option)")
+        lines.append("   \(index + 1)) \(option.label)")
+        // The explanation is half of what a choice means — the sheet on the desk shows it under the
+        // label, so a phone message that showed only labels made the user answer blind. Indented
+        // rather than run together on one line, which is the shape the GUI uses and the shape that
+        // keeps a four-option question readable. Clipped by the same rule as the question's own
+        // detail: it is a sentence to read, not the question itself.
+        if let description = option.description, !description.isEmpty {
+          lines.append("      \(RemoteSessionHistory.clip(description, to: detailLimit))")
+        }
       }
       if item.options.isEmpty {
         lines.append("   （这题没有选项，回答一段话即可）")
@@ -225,14 +252,15 @@ public enum QuestionAnswerParser {
     }
 
     var selected: [String] = []
+    let labels = item.optionLabels
     for token in tokens {
-      if let index = Int(token), index >= 1, index <= item.options.count {
-        selected.append(item.options[index - 1])
-      } else if item.options.contains(token) {
+      if let index = Int(token), index >= 1, index <= labels.count {
+        selected.append(labels[index - 1])
+      } else if labels.contains(token) {
         // The full label is also accepted: it is what a user copies from the question.
         selected.append(token)
       } else {
-        let options = item.options.enumerated()
+        let options = labels.enumerated()
           .map { "\($0.offset + 1)) \($0.element)" }
           .joined(separator: "  ")
         return .problem("「\(item.question)」没有「\(token)」这个选项。可选：\(options)")

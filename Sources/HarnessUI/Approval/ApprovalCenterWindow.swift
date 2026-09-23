@@ -23,7 +23,7 @@ public enum TurnWatchState: Sendable, Equatable {
   }
 }
 
-/// What the phone needs when a turn ends.
+/// What the phone needs while a turn runs, and when it ends.
 ///
 /// A seam rather than a reference to the channel: this model's job is "which endings are news", and
 /// a caller that also owned the transport would have to be handed a bot credential just to test that
@@ -31,6 +31,12 @@ public enum TurnWatchState: Sendable, Equatable {
 public protocol PhoneInfoForwarding: Sendable {
   /// Push one ended turn — a headline, and the answer it produced when there is one.
   func forwardTurn(_ completion: TurnCompletion) async
+  /// Push one paragraph of a running turn's plain text, as it is written.
+  ///
+  /// Separate from `forwardTurn` because it answers a different question — not "what happened" but
+  /// "what is it saying right now" — and because the volume rules differ: one turn can produce
+  /// dozens of these, so an implementation is expected to batch them rather than send each one.
+  func forwardAssistantText(_ segment: AssistantTextSegment) async
 }
 
 /// The approval model: one live subscription to the harness's forwarded-event stream, and
@@ -234,6 +240,9 @@ public final class ApprovalAlertModel: ObservableObject {
       },
       onCompletion: { [weak self] completion in
         await self?.deliver(completion)
+      },
+      onAssistantText: { [weak self] segment in
+        await self?.deliver(segment)
       }
     )
     watchClient = client
@@ -321,6 +330,17 @@ public final class ApprovalAlertModel: ObservableObject {
       return
     }
     presenter.postTurnCompletion(completion)
+  }
+
+  /// Forward one paragraph of a running turn to the phone.
+  ///
+  /// The same two rules as `deliver(_: TurnCompletion)`, for the same reasons: forwarding happens
+  /// before the local notification gates (those answer "do I want popups on this Mac", while the
+  /// phone has its own switch), and a subagent's chatter stays out unless the user asked for
+  /// subagents — noise from a fan-out is worse on a phone than in a notification centre.
+  func deliver(_ segment: AssistantTextSegment) async {
+    guard !(segment.isSubagent && !subagentNotificationsEnabled) else { return }
+    await phoneForwarder?.forwardAssistantText(segment)
   }
 
   /// Reflect a watcher that cannot follow this harness, so the footer can say so instead of leaving

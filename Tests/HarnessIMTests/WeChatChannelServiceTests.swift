@@ -28,6 +28,21 @@ final class ScriptedILinkTransport: ILinkHTTPTransport, @unchecked Sendable {
   /// refusing the call rather than the account.
   var pollRejection: String?
 
+  /// When set, `sendmessage` refuses with this body and nothing is recorded as sent. Used to prove
+  /// that text a refused send dropped is not mistaken for text the phone received.
+  var sendRejection: String?
+
+  /// How long `sendmessage` takes to answer. Lets a test observe the world while a send is in
+  /// flight, which is the only way to assert on what the *user* sees during a network round trip.
+  var sendDelay: TimeInterval = 0
+
+  /// Whether a `sendmessage` has been received at all, set before any delay.
+  var sendReached: Bool {
+    lock.lock(); defer { lock.unlock() }
+    return reachedSend
+  }
+  private var reachedSend = false
+
   /// - Parameter batches: successive `getupdates` payloads; afterwards the poll is empty.
   init(batches: [[String]]) {
     self.queue = batches
@@ -41,6 +56,12 @@ final class ScriptedILinkTransport: ILinkHTTPTransport, @unchecked Sendable {
   var sentMessages: [String] {
     lock.lock(); defer { lock.unlock() }
     return sentTexts
+  }
+
+  /// Drop what has been recorded so far, so a test can assert on the messages its own scenario
+  /// produced without having to name the connectivity self-check in every expectation.
+  func forgetSentMessages() {
+    lock.lock(); sentTexts.removeAll(); lock.unlock()
   }
 
   var didStart: Bool {
@@ -71,9 +92,15 @@ final class ScriptedILinkTransport: ILinkHTTPTransport, @unchecked Sendable {
       return ILinkHTTPResponse(status: 200, body: Data(#"{"ret":0}"#.utf8))
     }
     if url.contains("sendmessage") {
+      lock.lock(); reachedSend = true; let delay = sendDelay; lock.unlock()
+      if delay > 0 { try? await Task.sleep(for: .seconds(delay)) }
       let body = request.body.flatMap { try? JSONValue.parse($0) }
       let text = body?.path("msg.item_list.0.text_item.text")?.stringValue ?? ""
-      lock.lock(); sentTexts.append(text); lock.unlock()
+      lock.lock()
+      let rejection = sendRejection
+      if rejection == nil { sentTexts.append(text) }
+      lock.unlock()
+      if let rejection { return ILinkHTTPResponse(status: 200, body: Data(rejection.utf8)) }
       return ILinkHTTPResponse(status: 200, body: Data(#"{"ret":0}"#.utf8))
     }
     if url.contains("getupdates") {
@@ -120,6 +147,7 @@ final class WeChatChannelServiceTests: XCTestCase {
     harnessURL: URL? = URL(string: "http://127.0.0.1:59995/?token=test-token"),
     harnessResponders: ((StubHarnessTransport.Call) -> HarnessAPIResponse)? = nil,
     reply: HarnessReply? = HarnessReply(text: "结果是 42", turn: 1, reason: "completed", isComplete: true),
+    narration: WeChatChannelService.NarrationConfiguration = .init(interval: 0.05),
     config: ChannelConfig? = nil,
     approvalStream: StubRemoteEventStream? = nil,
     sessionList: String? = nil,
@@ -208,6 +236,7 @@ final class WeChatChannelServiceTests: XCTestCase {
       dshHome: { self.root.appendingPathComponent("home") },
       client: ILinkClient(transport: providerTransport),
       replyConfiguration: .init(pollInterval: .milliseconds(20), timeout: .seconds(5)),
+      narrationConfiguration: narration,
       harnessTransport: {
         onHarnessTransportCreate?()
         return harnessTransport
@@ -257,6 +286,21 @@ final class WeChatChannelServiceTests: XCTestCase {
     }
   }
 
+  /// Turn 手机远控 on the way the app does, then drop the connectivity self-check from the record.
+  ///
+  /// The self-check has tests of its own; every other test that enables the switch is about the
+  /// messages its own scenario produces, and naming the probe in each of those expectations would
+  /// bury what they are actually asserting. The wait is what makes this honest — the probe is a real
+  /// send, and the test only moves on once it has happened.
+  private func enablePhoneControl(
+    _ service: WeChatChannelService,
+    _ provider: ScriptedILinkTransport
+  ) async throws {
+    await service.setForwardsAllPrompts(true)
+    try await waitUntil { !provider.sentMessages.isEmpty }
+    provider.forgetSentMessages()
+  }
+
   private func waitUntil(timeout: TimeInterval = 5, _ condition: () async -> Bool) async throws {
     let deadline = Date().addingTimeInterval(timeout)
     while Date() < deadline {
@@ -282,7 +326,6 @@ final class WeChatChannelServiceTests: XCTestCase {
   func testRefusedPollKeepsPollingAndShowsWhatTheProviderSaid() async throws {
     let (service, provider, _, _) = try await makeService(batches: [])
     provider.pollRejection = #"{"ret":-2,"errmsg":"参数错误：context_token 无效"}"#
-
     await service.start()
     try await waitUntil {
       let status = await service.currentStatus()
@@ -1270,7 +1313,7 @@ final class WeChatChannelServiceTests: XCTestCase {
   func testForwardingSendsTheHeadlineAndTheTurnsAnswer() async throws {
     let (service, provider, _, _) = try await makeService(batches: [])
     await service.start()
-    await service.setForwardsAllPrompts(true)
+    try await enablePhoneControl(service, provider)
     try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [
       (1, "第一轮的答案"),
       (2, "第二轮的答案"),
@@ -1289,7 +1332,7 @@ final class WeChatChannelServiceTests: XCTestCase {
   func testForwardingReadsOnlyTheNamedTurn() async throws {
     let (service, provider, _, _) = try await makeService(batches: [])
     await service.start()
-    await service.setForwardsAllPrompts(true)
+    try await enablePhoneControl(service, provider)
     try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [
       (1, "旧的答案"),
       (2, "新的答案"),
@@ -1308,7 +1351,7 @@ final class WeChatChannelServiceTests: XCTestCase {
   func testForwardingStillSendsTheHeadlineWithoutALoggableAnswer() async throws {
     let (service, provider, _, _) = try await makeService(batches: [])
     await service.start()
-    await service.setForwardsAllPrompts(true)
+    try await enablePhoneControl(service, provider)
 
     await service.forwardTurnInfo(TurnCompletion(
       sessionID: "session-nowhere", sessionTitle: "报告", turn: 1, kind: .completed, cwd: workspace.path
@@ -1342,13 +1385,324 @@ final class WeChatChannelServiceTests: XCTestCase {
     XCTAssertEqual(WeChatChannelService.bounded("   \n  ", limit: 10), "")
   }
 
+  // MARK: - Connectivity self-check
+
+  /// Switching the phone on says so *to the phone*, so "远控开着却什么都收不到" has an answer: either
+  /// the self-check arrives or the window explains why it did not.
+  func testTurningTheSwitchOnSendsAConnectivityProbe() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+
+    await service.setForwardsAllPrompts(true)
+
+    try await waitUntil { !provider.sentMessages.isEmpty }
+    let sent = provider.sentMessages
+    XCTAssertEqual(sent.count, 1, "开启时只应有一条自检消息：\(sent)")
+    XCTAssertTrue(sent[0].contains("连通性自检"), sent[0])
+    // The wording tells the user what seeing it means, and what will follow.
+    XCTAssertTrue(sent[0].contains("通道是通的"), sent[0])
+    XCTAssertTrue(sent[0].contains("不需要回复"), sent[0])
+    await service.stop()
+  }
+
+  /// It reports the outcome where the user is actually looking, and a send that worked clears an
+  /// error left over from before — the strongest evidence there is that the link is back.
+  func testASuccessfulProbeSaysSoAndClearsAStaleError() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    provider.sendRejection = #"{"ret":-2,"errmsg":"参数错误：context_token 无效"}"#
+    await service.setForwardsAllPrompts(true)
+    try await waitUntil { await service.currentStatus().lastError != nil }
+
+    let failed = await service.currentStatus()
+    XCTAssertTrue(failed.detail?.contains("没能送达") == true, failed.detail ?? "无")
+
+    // A second attempt with the provider answering normally: the detail flips, the error clears.
+    provider.sendRejection = nil
+    await service.setForwardsAllPrompts(false)
+    await service.setForwardsAllPrompts(true)
+
+    try await waitUntil { await service.currentStatus().lastError == nil }
+    let recovered = await service.currentStatus()
+    XCTAssertTrue(recovered.detail?.contains("已送达手机") == true, recovered.detail ?? "无")
+    XCTAssertEqual(provider.sentMessages, [WeChatChannelService.phoneLinkProbeText])
+    await service.stop()
+  }
+
+  /// The button flips on the user's click, not when the provider answers. The self-check is a network
+  /// round trip, and a switch that looks dead for its duration is a worse bug than the silence it was
+  /// meant to remove.
+  func testTheSwitchIsPublishedWhileTheSelfCheckIsStillInFlight() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    provider.sendDelay = 0.5
+
+    let toggling = Task { await service.setForwardsAllPrompts(true) }
+    try await waitUntil(timeout: 2) { provider.sendReached }
+
+    let inFlight = await service.currentStatus()
+    XCTAssertTrue(inFlight.forwardsAllPrompts, "自检还在路上时，开关就应该已经显示为开启")
+    XCTAssertTrue(provider.sentMessages.isEmpty, "自检尚未返回，不该已经记成送达")
+
+    await toggling.value
+    try await waitUntil { !provider.sentMessages.isEmpty }
+    await service.stop()
+  }
+
+  /// Switching **off** is not a moment to send anything: the phone is being taken off the hook, and a
+  /// message arriving to announce that would be the last thing the user expects.
+  func testTurningTheSwitchOffSendsNothing() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    await service.setForwardsAllPrompts(true)
+    try await waitUntil { provider.sentMessages.count == 1 }
+
+    await service.setForwardsAllPrompts(false)
+    try await Task.sleep(for: .milliseconds(150))
+
+    XCTAssertEqual(provider.sentMessages.count, 1, "关闭开关不应发消息：\(provider.sentMessages)")
+    await service.stop()
+  }
+
+  /// Every time it goes on, not just the first: the switch is a decision the user may be re-taking
+  /// after changing the bot, and a check that only ran once would not check the new one.
+  func testEverySwitchOnIsChecked() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+
+    await service.setForwardsAllPrompts(true)
+    try await waitUntil { provider.sentMessages.count == 1 }
+    await service.setForwardsAllPrompts(false)
+    await service.setForwardsAllPrompts(true)
+    try await waitUntil { provider.sentMessages.count == 2 }
+
+    XCTAssertEqual(provider.sentMessages, [
+      WeChatChannelService.phoneLinkProbeText,
+      WeChatChannelService.phoneLinkProbeText,
+    ])
+    await service.stop()
+  }
+
+  // MARK: - Running narration
+  /// The wording of a narration batch, pinned because it is what the user reads on a phone: the
+  /// conversation and the turn first, so two sessions narrating at once stay tellable apart.
+  func testNarrationHeadlineNamesTheSessionAndTheTurn() {
+    XCTAssertEqual(
+      WeChatChannelService.narrationHeadline(sessionTitle: "报告", sessionID: "session-x", turn: 4),
+      "📝 报告 · 第 4 轮"
+    )
+    // The same fallbacks as the turn headline: a blank title falls back to the id, a missing turn
+    // number to "本轮" rather than to "第 nil 轮".
+    XCTAssertEqual(
+      WeChatChannelService.narrationHeadline(sessionTitle: "   ", sessionID: "session-x", turn: nil),
+      "📝 session-x · 本轮"
+    )
+  }
+
+  /// The feature: a paragraph written mid-turn goes out while the turn is still running, instead of
+  /// waiting for the ending — which only ever forwards the *last* paragraph.
+  func testNarrationIsForwardedWhileTheTurnRuns() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    try await enablePhoneControl(service, provider)
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 4, step: 3, text: "这个要分两步验证。"
+    ))
+
+    try await waitUntil { !provider.sentMessages.isEmpty }
+    XCTAssertEqual(provider.sentMessages, ["📝 报告 · 第 4 轮\n这个要分两步验证。"])
+    await service.stop()
+  }
+
+  /// The volume rule: paragraphs written in one burst leave as one message, in order, separated so a
+  /// phone keeps the paragraph breaks the transcript had.
+  func testNarrationParagraphsInABurstBecomeOneMessage() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    try await enablePhoneControl(service, provider)
+
+    for text in ["先看 C 层。", "再看 B 层。", "结论是两边都被挡住了。"] {
+      await service.forwardAssistantText(AssistantTextSegment(
+        sessionID: "session-desk", sessionTitle: "报告", turn: 4, text: text
+      ))
+    }
+
+    try await waitUntil { !provider.sentMessages.isEmpty }
+    XCTAssertEqual(
+      provider.sentMessages,
+      ["📝 报告 · 第 4 轮\n先看 C 层。\n\n再看 B 层。\n\n结论是两边都被挡住了。"]
+    )
+    // One message, not three, and no second one arriving late.
+    try await Task.sleep(for: .milliseconds(150))
+    XCTAssertEqual(provider.sentMessages.count, 1)
+    await service.stop()
+  }
+
+  /// The other half of the bound: narration that arrives faster than the interval must not build an
+  /// arbitrarily long message, so a batch that is already big enough leaves immediately.
+  func testNarrationOverTheBatchLimitIsSentWithoutWaiting() async throws {
+    let (service, provider, _, _) = try await makeService(
+      batches: [],
+      narration: .init(interval: 30, batchLimit: 10)
+    )
+    await service.start()
+    try await enablePhoneControl(service, provider)
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 1, text: "这一段的长度已经超过了批次上限。"
+    ))
+
+    // No wait for the (30 second) interval: the size is what triggered it.
+    try await waitUntil(timeout: 2) { !provider.sentMessages.isEmpty }
+    XCTAssertEqual(provider.sentMessages.count, 1)
+    await service.stop()
+  }
+
+  /// The switch is the only gate for narration as well: with 手机远控 off, nothing goes out and
+  /// nothing is left buffered to leak when it is switched on later.
+  func testNarrationIsSilentUntilTheSwitchIsOn() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 1, text: "开关没开时说的一句话"
+    ))
+    try await Task.sleep(for: .milliseconds(150))
+    XCTAssertTrue(provider.sentMessages.isEmpty, "未开启手机远控时不应发出任何东西：\(provider.sentMessages)")
+
+    // Switching on later must not flush what was written while it was off.
+    try await enablePhoneControl(service, provider)
+    try await Task.sleep(for: .milliseconds(150))
+    XCTAssertTrue(provider.sentMessages.isEmpty, "开关打开后不应补发开关关闭期间的内容")
+    await service.stop()
+  }
+
+  /// Switching off drops the buffer: a paragraph collected a moment before the switch went off is
+  /// not a reason to keep sending after it.
+  func testSwitchingOffDropsBufferedNarration() async throws {
+    let (service, provider, _, _) = try await makeService(
+      batches: [],
+      narration: .init(interval: 2)
+    )
+    await service.start()
+    try await enablePhoneControl(service, provider)
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 1, text: "还没发出去的一段"
+    ))
+    await service.setForwardsAllPrompts(false)
+    try await Task.sleep(for: .milliseconds(300))
+
+    XCTAssertTrue(provider.sentMessages.isEmpty, "关闭远控后不应再有过程正文发出：\(provider.sentMessages)")
+    await service.stop()
+  }
+
+  /// The duplicate this exists to prevent: a turn's answer *is* its last paragraph, so once that
+  /// paragraph has gone out as narration the ending must not send it a second time.
+  func testTheTurnsAnswerIsNotForwardedTwiceWhenItWasNarrated() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    try await enablePhoneControl(service, provider)
+    try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [(2, "第二轮的答案")])
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 2, text: "第二轮的答案"
+    ))
+    try await waitUntil { !provider.sentMessages.isEmpty }
+
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 2, kind: .completed, cwd: workspace.path
+    ))
+
+    XCTAssertEqual(provider.sentMessages, [
+      "📝 报告 · 第 2 轮\n第二轮的答案",
+      "✅ 报告 · 第 2 轮完成",
+    ])
+    await service.stop()
+  }
+
+  /// The other side of that rule: narration that was *not* the answer does not suppress it. The
+  /// phone still gets the answer under the headline.
+  func testTheTurnsAnswerIsStillForwardedWhenNarrationWasSomethingElse() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    try await enablePhoneControl(service, provider)
+    try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [(2, "第二轮的答案")])
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 2, text: "先看看这个报告。"
+    ))
+    try await waitUntil { !provider.sentMessages.isEmpty }
+
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 2, kind: .completed, cwd: workspace.path
+    ))
+
+    XCTAssertEqual(provider.sentMessages, [
+      "📝 报告 · 第 2 轮\n先看看这个报告。",
+      "✅ 报告 · 第 2 轮完成",
+      "第二轮的答案",
+    ])
+    await service.stop()
+  }
+
+  /// A paragraph the provider refused is not remembered as sent, so the answer it carried still goes
+  /// out under the headline instead of being silently swallowed by the dedupe.
+  func testARefusedNarrationDoesNotSuppressTheAnswer() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [])
+    await service.start()
+    try await enablePhoneControl(service, provider)
+    try writeSessionLog(cwd: workspace.path, sessionID: "session-desk", turns: [(2, "第二轮的答案")])
+    provider.sendRejection = #"{"ret":-2,"errmsg":"参数错误：context_token 无效"}"#
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 2, text: "第二轮的答案"
+    ))
+    try await Task.sleep(for: .milliseconds(150))
+    XCTAssertTrue(provider.sentMessages.isEmpty, "发送被拒绝时不应记成已送达：\(provider.sentMessages)")
+
+    provider.sendRejection = nil
+    await service.forwardTurnInfo(TurnCompletion(
+      sessionID: "session-desk", sessionTitle: "报告", turn: 2, kind: .completed, cwd: workspace.path
+    ))
+
+    // The turn-end flush retries the refused paragraph first, then the headline; the answer itself is
+    // already on the phone as that paragraph, so it is not sent a third time.
+    XCTAssertEqual(provider.sentMessages, [
+      "📝 报告 · 第 2 轮\n第二轮的答案",
+      "✅ 报告 · 第 2 轮完成",
+    ])
+    await service.stop()
+  }
+
+  /// Narration follows the same ownership rule as the ending: a session the chat already answers for
+  /// must not have its paragraphs pushed back into the conversation they came from.
+  func testNarrationSkipsASessionTheChatAlreadyAnswersFor() async throws {
+    let (service, provider, _, _) = try await makeService(batches: [[
+      inboundText("1", "看看这个报告"),
+      inboundText("2", "开始"),
+    ]])
+    await service.start()
+    try await waitUntil { provider.sentMessages.contains("结果是 42") }
+    await service.setForwardsAllPrompts(true)
+    let before = provider.sentMessages.count
+
+    await service.forwardAssistantText(AssistantTextSegment(
+      sessionID: "session-test", sessionTitle: "微信会话", turn: 1, text: "渠道自己的会话在说的话"
+    ))
+    try await Task.sleep(for: .milliseconds(150))
+
+    XCTAssertEqual(provider.sentMessages.count, before, "渠道自己的会话不应被播报")
+    await service.stop()
+  }
+
   /// An unowned session is a desk session and always forwarded.
   func testUnownedSessionsAreForwarded() {
     XCTAssertTrue(WeChatChannelService.shouldForward(
       sessionID: "session-desk", owner: nil, adoptedSessionID: nil
     ))
   }
-
   /// A session the channel created already delivers its answer into the chat, so forwarding it again
   /// would send the same text twice.
   func testCreatedSessionsAreNotForwardedTwice() {

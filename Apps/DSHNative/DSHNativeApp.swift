@@ -1,5 +1,6 @@
 import HarnessConsoleUI
 import HarnessIM
+import HarnessMobileGateway
 import HarnessUI
 import HarnessRuntime
 import HarnessUI
@@ -22,6 +23,9 @@ struct DSHNativeApp: App {
   /// while the approval centre was open would never be seen.
   @StateObject private var alerts: ApprovalAlertModel
   @StateObject private var backup: SessionBackupModel
+  /// The native mobile gateway. App-level like the channel below: a gateway that only ran while
+  /// its window was open would drop the phone mid-turn.
+  @StateObject private var mobileGateway: MobileGatewayModel
   /// The running harness as the extra windows see it. The main window publishes the
   /// address here; every other window reads it, so no second window starts a server.
   @StateObject private var harnessPageHost = HarnessPageHost()
@@ -130,6 +134,14 @@ struct DSHNativeApp: App {
       stagingRoot: base.stagingRoot,
       onImported: { DSHNativeApp.mainModel?.reload() }
     ))
+
+    // Built here, not in the window: the gateway binds its listener and holds the paired-device
+    // registry for the life of the app, and a window that owned it would stop accepting phone
+    // connections the moment the user closed the panel.
+    _mobileGateway = StateObject(wrappedValue: MobileGatewayModel(
+      appRoot: base.root,
+      harnessURL: { DSHNativeApp.harnessURL.value }
+    ))
   }
 
   /// The window the user thinks of as "the app".
@@ -159,6 +171,7 @@ struct DSHNativeApp: App {
           // stays down on purpose: it is an outbound network client holding provider
           // credentials, and "start clean" has to mean that too.
           if DSHNativeApp.harnessURL.value != nil, !safeBoot.isSafe { wechat.harnessBecameAvailable() }
+          mobileGateway.harnessBecameAvailable()
           Task { await alerts.refreshConnection() }
         }
         // The channel reads this on every submission, so it must follow start/stop.
@@ -168,6 +181,9 @@ struct DSHNativeApp: App {
           // The harness only accepts workspace registration once it is listening, so the
           // repair pass waits for this moment rather than racing the harness's startup.
           if DSHNativeApp.harnessURL.value != nil, !safeBoot.isSafe { wechat.harnessBecameAvailable() }
+          // A harness restart means a new port and a new single-use token, so the gateway's
+          // API client has to be rebuilt rather than left pointed at a dead address.
+          mobileGateway.harnessBecameAvailable()
           Task { await alerts.refreshConnection() }
         }
         // Stopping the harness leaves the address in place while it is down, so the extra
@@ -241,6 +257,15 @@ struct DSHNativeApp: App {
     }
     .defaultSize(width: 660, height: 660)
 
+    // Its own window, and reachable from the Harness menu: the gateway has to keep serving
+    // while this is closed, and pairing happens while the user is holding a phone — not while
+    // they are looking at a transcript.
+    Window("移动设备", id: HarnessWindowID.mobileGateway) {
+      MobileGatewayWindow(model: mobileGateway)
+        .onAppear { mobileGateway.harnessBecameAvailable() }
+    }
+    .defaultSize(width: 640, height: 700)
+
     Window("恢复模式", id: HarnessWindowID.recovery) {
       HarnessRecoveryWindow(recovery: recovery, console: console)
         // The app's main window owns the server's lifecycle; this window manages the
@@ -307,6 +332,14 @@ private struct HarnessMenu: Commands {
       .keyboardShortcut("w", modifiers: [.command, .shift])
       // The channel is an outbound client to the provider holding stored credentials.
       // Safe Mode is meant to take things out of the picture, so it stays down.
+      .disabled(safeBoot.isSafe)
+
+      Button("移动设备…") {
+        openWindow(id: HarnessWindowID.mobileGateway)
+      }
+      .keyboardShortcut("m", modifiers: [.command, .shift])
+      // Same reasoning as the channel: the gateway accepts connections from the network and
+      // executes work on this machine, which is exactly what Safe Mode removes.
       .disabled(safeBoot.isSafe)
 
       Divider()

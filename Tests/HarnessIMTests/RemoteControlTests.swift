@@ -370,10 +370,45 @@ final class QuestionDecodingTests: XCTestCase {
     let item = question.items[0]
     XCTAssertEqual(item.id, "q1")
     XCTAssertEqual(item.header, "计划")
-    XCTAssertEqual(item.options, ["开始执行", "继续修改"])
+    XCTAssertEqual(item.options, [.init(label: "开始执行"), .init(label: "继续修改")])
+    XCTAssertEqual(item.optionLabels, ["开始执行", "继续修改"])
     XCTAssertEqual(item.approveLabel, "开始执行")
     XCTAssertFalse(item.multiSelect)
     XCTAssertTrue(question.isBorrowed)
+  }
+
+  /// The explanation under a choice is part of the choice, and it has to survive decoding or the
+  /// phone never sees it — which is the whole reason the field arrives at all.
+  func testDecodesEachOptionsExplanation() throws {
+    let question = try XCTUnwrap(QuestionPrompt.decode(
+      try request(#"""
+      {"questions":[
+        {"id":"q1","question":"走哪条？","options":[
+          {"label":"节流","description":"每 5 秒或 400 字发一条。"},
+          {"label":"逐条"},
+          {"label":"混合","description":"   "}
+        ]}
+      ]}
+      """#),
+      eventID: "e", sessionID: "s", isBorrowed: false
+    ))
+
+    let options = question.items[0].options
+    XCTAssertEqual(options.map(\.label), ["节流", "逐条", "混合"])
+    // No explanation and a blank explanation are the same thing: nothing to print.
+    XCTAssertEqual(options.map(\.description), ["每 5 秒或 400 字发一条。", nil, nil])
+    // The labels are what an answer is matched against, unchanged by the extra field.
+    XCTAssertEqual(question.items[0].optionLabels, ["节流", "逐条", "混合"])
+  }
+
+  /// An option with no `label` is not an option: the host matches answers by label, so a choice that
+  /// cannot be named cannot be answered.
+  func testDropsOptionsWithoutALabel() throws {
+    let question = try XCTUnwrap(QuestionPrompt.decode(
+      try request(#"{"questions":[{"id":"q1","question":"选一个","options":[{"description":"没有标签"},{"label":"甲"}]}]}"#),
+      eventID: "e", sessionID: "s", isBorrowed: false
+    ))
+    XCTAssertEqual(question.items[0].optionLabels, ["甲"])
   }
 
   /// An entry we cannot address or show must not make the whole payload unanswerable.
@@ -393,7 +428,7 @@ final class QuestionDecodingTests: XCTestCase {
 
   func testPromptTextTeachesTheGrammar() {
     let question = PendingQuestion(eventID: "e", sessionID: "session-12345678", isBorrowed: true, items: [
-      QuestionItem(id: "q1", question: "选一个", options: ["甲", "乙"], multiSelect: false),
+      QuestionItem(id: "q1", question: "选一个", options: [.init(label: "甲"), .init(label: "乙")], multiSelect: false),
     ])
     let text = QuestionPrompt.text(for: question)
     XCTAssertTrue(text.contains("需要你回答"), text)
@@ -401,12 +436,49 @@ final class QuestionDecodingTests: XCTestCase {
     XCTAssertTrue(text.contains("1) 甲"), text)
     XCTAssertTrue(text.contains("/answer 1"), text)
   }
+
+  /// The line under a choice is half of what it means. The GUI sheet shows it, so the phone message
+  /// has to carry it too — a user reading three bare labels is choosing blind.
+  func testPromptTextCarriesEachOptionsExplanation() {
+    let question = PendingQuestion(eventID: "e", sessionID: "s", isBorrowed: false, items: [
+      QuestionItem(id: "q1", question: "白字正文用哪种方式发到微信？", options: [
+        .init(label: "节流式实时转发", description: "距上一条 ≥5 秒或累积 ≥400 字才发一条。"),
+        .init(label: "每条白字立即各发一条", description: "最忠实，但长回合会推 ~30 条。"),
+        .init(label: "只在轮末合成 1–2 条"),
+      ]),
+    ])
+
+    let text = QuestionPrompt.text(for: question)
+    XCTAssertTrue(text.contains("1) 节流式实时转发"), text)
+    XCTAssertTrue(text.contains("距上一条 ≥5 秒或累积 ≥400 字才发一条。"), text)
+    XCTAssertTrue(text.contains("2) 每条白字立即各发一条\n      最忠实，但长回合会推 ~30 条。"), text)
+    // An option with no explanation prints its label alone, with no empty indented line.
+    XCTAssertTrue(text.contains("3) 只在轮末合成 1–2 条\n"), text)
+    XCTAssertFalse(text.contains("3) 只在轮末合成 1–2 条\n   \n"), text)
+  }
+
+  /// A description is a sentence to read, not the question itself, so it is bounded like the
+  /// question's own `detail` — a runaway description must not turn one option into a wall.
+  func testPromptTextClipsALongOptionExplanation() {
+    let long = String(repeating: "长", count: 400)
+    let question = PendingQuestion(eventID: "e", sessionID: "s", isBorrowed: false, items: [
+      QuestionItem(id: "q1", question: "选一个", options: [.init(label: "甲", description: long)]),
+    ])
+
+    let text = QuestionPrompt.text(for: question)
+    XCTAssertFalse(text.contains(long), "整段说明不该原样发出")
+    XCTAssertTrue(text.contains(String(repeating: "长", count: QuestionPrompt.detailLimit)), text)
+  }
 }
 
 final class QuestionAnswerParserTests: XCTestCase {
   private func single(options: [String], multiSelect: Bool = false) -> PendingQuestion {
     PendingQuestion(eventID: "e", sessionID: "s", isBorrowed: false, items: [
-      QuestionItem(id: "q1", question: "选一个", options: options, multiSelect: multiSelect),
+      QuestionItem(
+        id: "q1", question: "选一个",
+        options: options.map { .init(label: $0) },
+        multiSelect: multiSelect
+      ),
     ])
   }
 
@@ -468,8 +540,8 @@ final class QuestionAnswerParserTests: XCTestCase {
 
   func testMultipleQuestionsAreAnsweredPositionally() throws {
     let question = PendingQuestion(eventID: "e", sessionID: "s", isBorrowed: false, items: [
-      QuestionItem(id: "q1", question: "一", options: ["甲", "乙"]),
-      QuestionItem(id: "q2", question: "二", options: ["丙", "丁"]),
+      QuestionItem(id: "q1", question: "一", options: [.init(label: "甲"), .init(label: "乙")]),
+      QuestionItem(id: "q2", question: "二", options: [.init(label: "丙"), .init(label: "丁")]),
     ])
     let outcome = QuestionAnswerParser.parse("2 | 1", for: question)
     guard case .answers(let value) = outcome else { return XCTFail("expected answers") }
@@ -484,8 +556,8 @@ final class QuestionAnswerParserTests: XCTestCase {
   /// Too few segments must not silently answer only the first question.
   func testWrongSegmentCountIsRejected() {
     let question = PendingQuestion(eventID: "e", sessionID: "s", isBorrowed: false, items: [
-      QuestionItem(id: "q1", question: "一", options: ["甲"]),
-      QuestionItem(id: "q2", question: "二", options: ["乙"]),
+      QuestionItem(id: "q1", question: "一", options: [.init(label: "甲")]),
+      QuestionItem(id: "q2", question: "二", options: [.init(label: "乙")]),
     ])
     guard case .problem(let message) = QuestionAnswerParser.parse("1", for: question) else {
       return XCTFail("expected a problem")

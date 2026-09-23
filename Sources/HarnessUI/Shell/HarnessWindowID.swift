@@ -20,6 +20,10 @@ public enum HarnessWindowID {
   public static let market = "harness.market"
   public static let console = "harness.console"
   public static let wechat = "harness.wechat"
+  /// The native mobile gateway: pairing QR, trusted devices, and the run mode. App-level
+  /// rather than a page of the harness Web UI, because the gateway serves phones while no
+  /// page is open.
+  public static let mobileGateway = "harness.mobileGateway"
   public static let approvals = "harness.approvals"
   public static let backup = "harness.backup"
   public static let recovery = "harness.recovery"

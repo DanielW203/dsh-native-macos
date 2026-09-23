@@ -2,13 +2,16 @@ import Foundation
 import HarnessIM
 import HarnessKit
 
-/// Watches live sessions for turn endings and reports the ones worth telling the user about.
+/// Watches live sessions for what is worth telling the user about: turn endings, and the plain
+/// assistant text a running turn commits as it goes.
 ///
 /// **Why this exists at all.** The harness's forwarded-event stream (`$events`) carries only the
 /// events the host assembly selects for forwarding — approvals and user questions — and that
 /// selection is declared host-side, so no client can add `turn/end` to it. Turn endings are durable
 /// session events instead, which means reading them requires subscribing to `session/follow` per
 /// session. That is what this actor does, and it is the only reason it holds sockets of its own.
+/// The running narration (`assistant/message`) rides the same durable stream, so it costs no
+/// second subscription.
 ///
 /// **Two rules that keep it from being annoying:**
 ///
@@ -71,6 +74,13 @@ public actor TurnCompletionWatcher {
 
   private let followerFactory: @Sendable (String) async throws -> any SessionFollowing
   private let onCompletion: @Sendable (TurnCompletion) async -> Void
+  /// Called once per assistant step that produced plain text, before its turn ends.
+  ///
+  /// A separate channel from `onCompletion` because it is a separate fact: the same follow stream
+  /// carries both, but a caller may want the running narration without the endings, or the endings
+  /// without the narration. Defaults to a no-op so a caller that only wants endings — and every
+  /// test written before this existed — is unaffected.
+  private let onAssistantText: @Sendable (AssistantTextSegment) async -> Void
   private let sessionLimit: Int
   private let retryBase: TimeInterval
   private let retryCeiling: TimeInterval
@@ -94,13 +104,15 @@ public actor TurnCompletionWatcher {
     retryBase: TimeInterval = 1,
     retryCeiling: TimeInterval = 60,
     followerFactory: @escaping @Sendable (String) async throws -> any SessionFollowing,
-    onCompletion: @escaping @Sendable (TurnCompletion) async -> Void
+    onCompletion: @escaping @Sendable (TurnCompletion) async -> Void,
+    onAssistantText: @escaping @Sendable (AssistantTextSegment) async -> Void = { _ in }
   ) {
     self.sessionLimit = max(1, sessionLimit)
     self.retryBase = retryBase
     self.retryCeiling = retryCeiling
     self.followerFactory = followerFactory
     self.onCompletion = onCompletion
+    self.onAssistantText = onAssistantText
   }
 
   // MARK: - Targets
@@ -211,7 +223,7 @@ public actor TurnCompletionWatcher {
             // The catch-up may already have delivered this one: the page can overlap frames the
             // previous stream had in flight. Announcing a turn twice is worse than missing it.
             guard isNewer(seq, for: sessionID) else { continue }
-            await report(sessionID: sessionID, type: type, turn: turn, data: data)
+            await report(sessionID: sessionID, type: type, seq: seq, turn: turn, data: data)
           case .assistantStream, .unrecognized:
             continue
           }
@@ -274,13 +286,32 @@ public actor TurnCompletionWatcher {
     for record in records {
       if let seq = record.seq, seq > highest { highest = seq }
       guard let baseline, let seq = record.seq, seq > baseline else { continue }
-      await report(sessionID: sessionID, type: record.type, turn: record.turn, data: record.data)
+      await report(sessionID: sessionID, type: record.type, seq: record.seq, turn: record.turn, data: record.data)
     }
     watermark[sessionID] = highest
   }
 
-  private func report(sessionID: String, type: String, turn: Int?, data: JSONValue) async {
+  /// Announce one durable event, if it is one the caller asked to hear about.
+  ///
+  /// Two kinds qualify and they do not overlap: `turn/end` becomes a completion, and any step that
+  /// committed `assistant/message` with plain text becomes a segment. Everything else — tool calls,
+  /// results, approvals, reasoning — is either already relayed elsewhere or deliberately not the
+  /// phone's business.
+  private func report(sessionID: String, type: String, seq: Int?, turn: Int?, data: JSONValue) async {
     let target = targets[sessionID]
+    if var segment = AssistantTextSegment.decode(
+      sessionID: sessionID,
+      eventType: type,
+      seq: seq,
+      data: data
+    ) {
+      segment.sessionTitle = target?.title
+      segment.isSubagent = target?.isSubagent ?? false
+      if segment.turn == nil { segment.turn = turn }
+      await onAssistantText(segment)
+      return
+    }
+
     guard var completion = TurnCompletion.decode(
       sessionID: sessionID,
       eventType: type,

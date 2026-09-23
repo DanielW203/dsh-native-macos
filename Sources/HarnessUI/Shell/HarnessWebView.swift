@@ -30,14 +30,56 @@ public enum WebNavigationPolicy {
   }
 }
 
+/// Forwards the page's own console and error output into the app log.
+///
+/// A web view has no console a human can read, so a page that throws while loading, or a
+/// stream that never opens, is invisible from outside — the app log already carries the
+/// harness's side and nothing else. Installing a relay puts the browser side next to it,
+/// which is the only way to tell "the host never answered" from "the page failed first".
+///
+/// The stream is capped and de-duplicated: a page stuck in a warning loop must not be able
+/// to fill the log it is being diagnosed from.
+private final class WebPageConsoleRelay: NSObject, WKScriptMessageHandler {
+  private let onEvent: (String) -> Void
+  private var forwarded = 0
+  private var lastLine: String?
+  private var repeats = 0
+
+  /// Messages forwarded per page load; the tail of a storm is rarely the informative part.
+  private static let limit = 400
+
+  init(onEvent: @escaping (String) -> Void) {
+    self.onEvent = onEvent
+  }
+
+  func userContentController(
+    _ userContentController: WKUserContentController,
+    didReceive message: WKScriptMessage
+  ) {
+    guard let text = message.body as? String, !text.isEmpty else { return }
+    if text == lastLine {
+      repeats += 1
+      // One identical line is noise; the hundredth is a loop worth reporting.
+      guard repeats == 100 || repeats == 1000 else { return }
+      onEvent("page log: \(text) (repeated \(repeats)x)")
+      return
+    }
+    lastLine = text
+    repeats = 0
+    guard forwarded < Self.limit else { return }
+    forwarded += 1
+    onEvent("page log: \(text)")
+    if forwarded == Self.limit { onEvent("page log: further messages suppressed for this page") }
+  }
+}
+
 /// Owns the WKWebView and publishes its loading state.
 ///
 /// A class rather than plain SwiftUI state because the web view outlives any single view
 /// body: reloading the window must not throw away the loaded application, and a stale
 /// WKWebView is what makes a "Reload" button either useless or destructive.
 @MainActor
-public final class HarnessWebModel: NSObject, ObservableObject {
-  @Published public private(set) var isLoading = false
+public final class HarnessWebModel: NSObject, ObservableObject {  @Published public private(set) var isLoading = false
   @Published public private(set) var progress: Double = 0
   @Published public private(set) var failure: String?
   @Published public private(set) var title: String?
@@ -52,6 +94,9 @@ public final class HarnessWebModel: NSObject, ObservableObject {
   /// settings tab lives in React state — so reaching a tab from outside means clicking
   /// through the interface.
   private let postLoadScript: String?
+  /// Keeps the page's console relay alive for the lifetime of the page; the content
+  /// controller also holds it, but the app owns the decision to install one.
+  private let consoleRelay: WebPageConsoleRelay
   private var observations: [NSKeyValueObservation] = []
 
   public init(
@@ -72,9 +117,24 @@ public final class HarnessWebModel: NSObject, ObservableObject {
     configuration.websiteDataStore = .default()
     configuration.defaultWebpagePreferences.allowsContentJavaScript = true
 
+    // The page reports its own console errors and rejections through this relay (see
+    // `webPageConsoleRelayScript`); without it the app log carries only the harness half.
+    let consoleRelay = WebPageConsoleRelay(onEvent: onEvent)
+    configuration.userContentController.add(consoleRelay, name: Self.consoleRelayName)
+    configuration.userContentController.addUserScript(WKUserScript(
+      source: Self.webPageConsoleRelayScript,
+      injectionTime: .atDocumentStart,
+      forMainFrameOnly: true
+    ))
+    self.consoleRelay = consoleRelay
+
     self.webView = WKWebView(frame: .zero, configuration: configuration)
     super.init()
 
+    // Safari's Develop menu is how a stuck page gets inspected at all: the window has no
+    // console, and the interesting failures (a stream that never opens) leave no trace
+    // anywhere else.
+    webView.isInspectable = true
     webView.navigationDelegate = self
     webView.allowsBackForwardNavigationGestures = false
 
@@ -96,6 +156,45 @@ public final class HarnessWebModel: NSObject, ObservableObject {
   /// issued for, so every `host:port` gets a cookie of its own that never overwrites
   /// another one: `dsh-auth-<hash(host:port)>`.
   private static let authCookiePrefix = "dsh-auth-"
+
+  /// Message-handler name the injected relay script posts to.
+  private static let consoleRelayName = "dshPageLog"
+
+  /// Captures the page's console errors/warnings and its uncaught failures, and posts each
+  /// one line to the app. Installed at document start so it also catches failures that
+  /// happen while the bundles are still loading; a page opened in a browser is unaffected
+  /// (the `postMessage` throw is swallowed), so this never changes what the app serves.
+  static let webPageConsoleRelayScript = """
+  (function () {
+    try {
+      if (window.__dshPageLogRelay === true) return;
+      window.__dshPageLogRelay = true;
+      var post = function (level, text) {
+        try {
+          window.webkit.messageHandlers.\(consoleRelayName).postMessage(level + ': ' + String(text).slice(0, 800));
+        } catch (error) { /* no relay: a plain browser, or a window that is not ours */ }
+      };
+      var describe = function (value) {
+        if (value instanceof Error) return value.stack || (value.name + ': ' + value.message);
+        if (typeof value === 'string') return value;
+        try { return JSON.stringify(value); } catch (error) { return String(value); }
+      };
+      ['error', 'warn'].forEach(function (level) {
+        var original = console[level];
+        console[level] = function () {
+          try { original.apply(console, arguments); } catch (error) { /* keep relaying */ }
+          post(level, Array.prototype.map.call(arguments, describe).join(' '));
+        };
+      });
+      window.addEventListener('error', function (event) {
+        post('uncaught', (event.message || 'error') + ' @ ' + (event.filename || '') + ':' + (event.lineno || 0));
+      });
+      window.addEventListener('unhandledrejection', function (event) {
+        post('rejection', describe(event.reason));
+      });
+    } catch (error) { /* never break the page over its own diagnostics */ }
+  })();
+  """
 
   /// The cookie name the harness issues for `url`'s authority, or `nil` for a URL with no
   /// usable host and port.

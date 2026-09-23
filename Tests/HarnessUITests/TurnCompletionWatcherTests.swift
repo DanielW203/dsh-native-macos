@@ -69,6 +69,12 @@ private actor CompletionRecorder {
   func record(_ completion: TurnCompletion) { completions.append(completion) }
 }
 
+/// Collects the running narration the watcher reports, across the actor boundary.
+private actor NarrationRecorder {
+  private(set) var segments: [AssistantTextSegment] = []
+  func record(_ segment: AssistantTextSegment) { segments.append(segment) }
+}
+
 /// Counts how often a session's stream was opened.
 private actor OpenCounter {
   private(set) var count = 0
@@ -93,11 +99,13 @@ private final class FollowerRegistry: @unchecked Sendable {
 final class TurnCompletionWatcherTests: XCTestCase {
   private var registry: FollowerRegistry!
   private var recorder: CompletionRecorder!
+  private var narration: NarrationRecorder!
 
   override func setUp() {
     super.setUp()
     registry = FollowerRegistry()
     recorder = CompletionRecorder()
+    narration = NarrationRecorder()
   }
 
   /// A watcher whose streams come from stubs, plus the registry those stubs land in.
@@ -109,6 +117,7 @@ final class TurnCompletionWatcherTests: XCTestCase {
   ) -> TurnCompletionWatcher {
     let registry = registry!
     let recorder = recorder!
+    let narration = narration!
     return TurnCompletionWatcher(
       sessionLimit: sessionLimit,
       retryBase: retryBase,
@@ -121,6 +130,9 @@ final class TurnCompletionWatcherTests: XCTestCase {
       },
       onCompletion: { completion in
         await recorder.record(completion)
+      },
+      onAssistantText: { segment in
+        await narration.record(segment)
       }
     )
   }
@@ -217,6 +229,127 @@ final class TurnCompletionWatcherTests: XCTestCase {
     XCTAssertEqual(reported[0].sessionTitle, "Ship it")
     XCTAssertEqual(reported[0].kind, .completed)
     XCTAssertEqual(reported[0].turn, 1)
+    await watcher.stop()
+  }
+
+  // MARK: - Running narration
+
+  /// A `assistant/message` frame with text in it, the way the harness writes one per model step.
+  private func assistantText(
+    _ text: String,
+    turn: Int? = 1,
+    step: Int = 1,
+    seq: Int? = nil
+  ) -> SessionFollowFrame {
+    var data: [String: JSONValue] = [
+      "message": .object([
+        "id": .string("m-\(step)"),
+        "role": .string("assistant"),
+        "content": .array([.object(["type": .string("text"), "text": .string(text)])]),
+      ]),
+      "step": .number(Double(step)),
+    ]
+    if let turn { data["turn"] = .number(Double(turn)) }
+    return .event(type: "assistant/message", seq: seq, turn: turn, data: .object(data))
+  }
+
+  private func waitForNarration(_ count: Int) async {
+    await wait("\(count) narration segment(s)") { await self.narration.segments.count >= count }
+  }
+
+  /// The feature: the white text a running turn commits reaches the forwarder as it is written, with
+  /// the session it belongs to and the turn and cursor it came from.
+  func testRunningNarrationIsReportedAsItArrives() async {
+    let watcher = makeWatcher()
+    await watcher.setTargets([.init(sessionID: "s1", title: "报告")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+
+    let stub = registry.stub(for: "s1")
+    stub?.emit(.snapshot(cursor: 10, records: []))
+    stub?.emit(assistantText("这个要分两步验证。", turn: 4, step: 3, seq: 11))
+
+    await waitForNarration(1)
+    let reported = await narration.segments
+    XCTAssertEqual(reported.count, 1)
+    XCTAssertEqual(reported[0].sessionID, "s1")
+    XCTAssertEqual(reported[0].sessionTitle, "报告")
+    XCTAssertEqual(reported[0].text, "这个要分两步验证。")
+    XCTAssertEqual(reported[0].turn, 4)
+    XCTAssertEqual(reported[0].step, 3)
+    XCTAssertEqual(reported[0].seq, 11)
+    XCTAssertFalse(reported[0].isSubagent)
+    await watcher.stop()
+  }
+
+  /// A step that only called a tool has no text, and must not become an empty phone message.
+  func testStepsWithoutTextReportNoNarration() async {
+    let watcher = makeWatcher()
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+
+    let stub = registry.stub(for: "s1")
+    stub?.emit(.snapshot(cursor: 0, records: []))
+    stub?.emit(.event(type: "assistant/message", seq: 1, turn: 1, data: .object([
+      "turn": .number(1),
+      "message": .object([
+        "content": .array([.object(["type": .string("tool_use"), "id": .string("t"), "name": .string("Bash")])]),
+      ]),
+    ])))
+    stub?.emit(event("tool/result", turn: 1, seq: 2))
+    try? await Task.sleep(nanoseconds: 60_000_000)
+
+    let reported = await narration.segments
+    XCTAssertTrue(reported.isEmpty, "只有正文才算播报：\(reported)")
+    await watcher.stop()
+  }
+
+  /// The baseline rule applies to narration too: the first snapshot is history, and replaying it
+  /// would push yesterday's paragraphs to a phone on every app launch.
+  func testTheFirstSnapshotDoesNotReplayNarration() async {
+    let watcher = makeWatcher()
+    await watcher.setTargets([.init(sessionID: "s1")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 12, records: [
+      SessionFollowRecord(type: "assistant/message", seq: 11, turn: 2, data: .object([
+        "turn": .number(2),
+        "message": .object([
+          "content": .array([.object(["type": .string("text"), "text": .string("昨天说过的话")])]),
+        ]),
+      ])),
+    ]))
+    try? await Task.sleep(nanoseconds: 60_000_000)
+
+    let reported = await narration.segments
+    XCTAssertTrue(reported.isEmpty, "首次订阅的页面是历史，不是新闻：\(reported)")
+    await watcher.stop()
+  }
+
+  /// The other half: a paragraph missed while the stream was down arrives in the next snapshot's
+  /// page, and that one *is* news — the phone never heard it.
+  func testAReconnectCatchesUpOnTheParagraphsItMissed() async {
+    let watcher = makeWatcher()
+    await watcher.setTargets([.init(sessionID: "s1", title: "报告")], includeSubagents: false)
+    await waitUntilLive(watcher, sessionID: "s1")
+
+    registry.stub(for: "s1")?.emit(.snapshot(cursor: 10, records: []))
+    registry.stub(for: "s1")?.emit(assistantText("流还活着时说的话", turn: 4, step: 1, seq: 11))
+    await waitForNarration(1)
+
+    let reconnected = await reconnect("s1")
+    reconnected?.emit(.snapshot(cursor: 20, records: [
+      SessionFollowRecord(type: "assistant/message", seq: 15, turn: 4, data: .object([
+        "turn": .number(4),
+        "message": .object([
+          "content": .array([.object(["type": .string("text"), "text": .string("断线期间说的话")])]),
+        ]),
+      ])),
+    ]))
+
+    await waitForNarration(2)
+    let reported = await narration.segments
+    XCTAssertEqual(reported.map(\.text), ["流还活着时说的话", "断线期间说的话"])
+    XCTAssertEqual(reported.map(\.sessionTitle), ["报告", "报告"], "标题来自目标，不是事件")
     await watcher.stop()
   }
 
