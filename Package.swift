@@ -107,7 +107,9 @@ let package = Package(
     // Its own module rather than a pane of HarnessUI: it manages the runtime and a
     // profile's plugins and needs nothing from the transcript UI. One host — the DSHNative
     // app opens it twice, as the console window and as the plugin window, both driven by
-    // one `HarnessConsoleModel`.
+    // one `HarnessConsoleModel`. The skin manager window lives here too: it is the same
+    // kind of surface — a profile-level concern the menu bar owns — and it needs exactly
+    // the same dependencies.
     .target(
       name: "HarnessConsoleUI",
       dependencies: ["HarnessKit", "HarnessRuntime"],

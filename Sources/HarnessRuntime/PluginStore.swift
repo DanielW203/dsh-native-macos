@@ -1,6 +1,29 @@
 import Foundation
 import HarnessKit
 
+/// A plugin this app turned off to get a runtime to boot, and which release it did not boot
+/// under.
+///
+/// Separate from `PluginRecord` because the two answer different questions: the record is
+/// "what is installed", this is "what did we take out of the picture, and when it is worth
+/// putting back". The plugin window shows both, and a re-enable offer without the release id
+/// would be advice to put a plugin back into the version that could not load it.
+public struct QuarantinedPlugin: Sendable, Equatable, Identifiable {
+  public var name: String
+  /// The release this plugin was quarantined for.
+  public var releaseID: String
+  /// When the app disabled it.
+  public var disabledAt: String
+
+  public var id: String { "\(releaseID)|\(name)" }
+
+  public init(name: String, releaseID: String, disabledAt: String) {
+    self.name = name
+    self.releaseID = releaseID
+    self.disabledAt = disabledAt
+  }
+}
+
 /// One installed plugin as the console shows it.
 public struct PluginRecord: Sendable, Equatable, Identifiable {
   /// The dependency key. pnpm records the package's real name here even when the user
@@ -767,11 +790,16 @@ public actor PluginStore {
   /// - Parameter stripConfigOverride: remove a `cordis.patch.yml` entry that also disables
   ///   the plugin. Off by default, because that entry was written by another tool and the
   ///   user should confirm before it is edited.
+  /// - Parameter quarantinedDuring: the release this disable is a *rescue* for, when it was
+  ///   the app that decided rather than the user. It is recorded so the plugin can be
+  ///   re-enabled with confidence later: an automatic disable that nobody can tell apart from
+  ///   a deliberate one is a feature quietly switched off forever.
   public func setEnabled(
     _ name: String,
     enabled: Bool,
     profile: String,
-    stripConfigOverride: Bool = false
+    stripConfigOverride: Bool = false,
+    quarantinedDuring releaseID: String? = nil
   ) async throws -> PluginOperationResult {
     let lock = try FileLock(url: paths.lockFile)
     defer { lock.release() }
@@ -783,6 +811,7 @@ public actor PluginStore {
     guard ProfileManifest.dependencies(manifest)[name] != nil else {
       throw RuntimeError.unsupported("\(name) is not installed in profile \(profile)")
     }
+    let reason = releaseID.map { DisabledEntry.quarantineReason(releaseID: $0) } ?? DisabledEntry.userReason
 
     var changes: [String] = []
     var warnings: [String] = []
@@ -818,8 +847,11 @@ public actor PluginStore {
       let bundles = ProfileManifest.bundleList(manifest).filter { $0 != name }
       manifest = ProfileManifest.setBundleList(manifest, bundles)
       try ProfileManifest.write(manifest, to: manifestURL)
-      try recordDisabled(profile: profile, name: name)
+      try recordDisabled(profile: profile, name: name, reason: reason)
       changes.append("removed \(name) from dsh.profile.bundles")
+      if let releaseID {
+        changes.append("recorded \(name) as quarantined for \(releaseID)")
+      }
     }
 
     // A running profile keeps the bundle set it started with, so saying so is part of
@@ -830,16 +862,32 @@ public actor PluginStore {
 
   // MARK: - The app's own disabled ledger
 
-  private struct DisabledEntry: Codable, Sendable {
+  /// One plugin this app turned off, and why.
+  ///
+  /// The `reason` string was `"user"` for every entry before the upgrade ladder existed. It
+  /// stays a string, and `"user"` stays its value for a user-initiated disable, so a ledger
+  /// written by an older build still reads; the quarantine form is
+  /// `quarantine:<releaseID>`, parsed by `DisabledEntry`.
+  struct DisabledEntry: Codable, Sendable, Equatable {
+    static let userReason = "user"
+    static func quarantineReason(releaseID: String) -> String { "quarantine:\(releaseID)" }
+
     var disabledAt: String
     var reason: String
+
+    /// The release this plugin was quarantined *for*, when it was the app that disabled it.
+    var quarantinedReleaseID: String? {
+      guard reason.hasPrefix("quarantine:") else { return nil }
+      let id = String(reason.dropFirst("quarantine:".count))
+      return id.isEmpty ? nil : id
+    }
   }
 
-  private func ledgerURL(profile: String) -> URL {
+  private nonisolated func ledgerURL(profile: String) -> URL {
     profileDirectory(profile).appendingPathComponent("native-plugin-state.json")
   }
 
-  private func readLedger(profile: String) -> [String: DisabledEntry] {
+  private nonisolated func readLedger(profile: String) -> [String: DisabledEntry] {
     guard let data = try? Data(contentsOf: ledgerURL(profile: profile)) else { return [:] }
     return (try? JSONDecoder().decode([String: DisabledEntry].self, from: data)) ?? [:]
   }
@@ -853,9 +901,9 @@ public actor PluginStore {
   }
 
   @discardableResult
-  private func recordDisabled(profile: String, name: String) throws -> Bool {
+  private func recordDisabled(profile: String, name: String, reason: String) throws -> Bool {
     var ledger = readLedger(profile: profile)
-    ledger[name] = DisabledEntry(disabledAt: ISO8601DateFormatter().string(from: Date()), reason: "user")
+    ledger[name] = DisabledEntry(disabledAt: ISO8601DateFormatter().string(from: Date()), reason: reason)
     try writeLedger(profile: profile, ledger)
     return true
   }
@@ -868,9 +916,58 @@ public actor PluginStore {
     return true
   }
 
+  /// Forget a disabled mark without touching the profile's files.
+  ///
+  /// Used when the plugin the mark was about is no longer installed: there is nothing left to
+  /// re-enable, and the entry is now a lie the windows would keep repeating.
+  @discardableResult
+  private func clearDisabledEntry(profile: String, name: String) -> Bool {
+    (try? clearDisabledLedger(profile: profile, name: name)) ?? false
+  }
+
   /// Names this app disabled, mapped to when.
-  public func disabledLedger(profile: String) -> [String: String] {
+  public nonisolated func disabledLedger(profile: String) -> [String: String] {
     readLedger(profile: profile).mapValues { $0.disabledAt }
+  }
+
+  /// The plugins the app itself turned off for one release, with why and when.
+  ///
+  /// This is what the interface needs to say "turned off because 0.1.7-rc.1 could not load it"
+  /// rather than "disabled" — a difference the user has to see, because only one of the two
+  /// means the plugin is worth re-testing after an upgrade.
+  public nonisolated func quarantinedPlugins(profile: String, releaseID: String? = nil) -> [QuarantinedPlugin] {
+    readLedger(profile: profile)
+      .compactMap { name, entry -> QuarantinedPlugin? in
+        guard let release = entry.quarantinedReleaseID else { return nil }
+        if let releaseID, release != releaseID { return nil }
+        return QuarantinedPlugin(name: name, releaseID: release, disabledAt: entry.disabledAt)
+      }
+      .sorted { $0.name < $1.name }
+  }
+
+  /// Put every plugin quarantined *for one release* back into the profile's bundle list.
+  ///
+  /// The counterpart to the upgrade ladder's automatic disable. Only entries carrying a
+  /// quarantine reason for that release are touched: a plugin the user turned off on purpose
+  /// stays off, whatever release is being re-enabled.
+  ///
+  /// - Returns: the names that were re-enabled, sorted.
+  @discardableResult
+  public func clearQuarantine(profile: String, releaseID: String) async throws -> [String] {
+    let names = quarantinedPlugins(profile: profile, releaseID: releaseID).map(\.name)
+    var restored: [String] = []
+    for name in names {
+      do {
+        _ = try await setEnabled(name, enabled: true, profile: profile)
+        restored.append(name)
+      } catch {
+        // The plugin is not in the profile's dependencies any more — it was uninstalled while
+        // it was quarantined. Its ledger entry is stale rather than pending, so it goes too:
+        // leaving it would offer this same removal on every future launch.
+        clearDisabledEntry(profile: profile, name: name)
+      }
+    }
+    return restored.sorted()
   }
 
   // MARK: - The app's install log

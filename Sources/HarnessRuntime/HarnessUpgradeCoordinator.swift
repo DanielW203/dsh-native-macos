@@ -37,6 +37,19 @@ public actor HarnessUpgradeCoordinator {
   public typealias CheckFactory = @Sendable (String) async -> [any HarnessCheck]
   /// One progress line, for the console's log pane.
   public typealias ProgressReporter = @Sendable (String) -> Void
+  /// What the runtime's own output says about the plugins it loaded, given the address it
+  /// announced.
+  ///
+  /// A factory rather than a value because the answer only exists after a boot, and it is the
+  /// one signal that tells "the server is up" apart from "the server is up and the profile is
+  /// intact" — the distinction a 0.1.7-era boot made invisible.
+  public typealias BootHealthFactory = @Sendable (String) async -> HarnessBootHealth
+  /// Something that can put the app into Safe Mode for the next launch.
+  ///
+  /// Injected rather than called directly because the marker and the relaunch are the app's
+  /// business, not this actor's: the coordinator decides *that* a release needs its plugins
+  /// out of the picture; how that becomes a running app is the window's.
+  public typealias SafeModeEscalator = @Sendable (String) async -> Bool
 
   /// The name the coordinator itself contributes to every report.
   public static let bootCheckName = "boot"
@@ -51,6 +64,16 @@ public actor HarnessUpgradeCoordinator {
   private let currentRuntime: RuntimeProbe
   private let makeChecks: CheckFactory
   private let progress: ProgressReporter
+  /// The pre-upgrade plugin probe. `nil` keeps the old behaviour exactly: activate, boot,
+  /// verify, roll back — which is what a test or a stripped build gets.
+  private let preflight: (any PluginPreflighting)?
+  /// What a boot's output said about the plugins. `nil` means this build cannot tell, and the
+  /// coordinator falls back to "running is good enough".
+  private let bootHealth: BootHealthFactory?
+  /// How a release that cannot be repaired becomes a Safe Mode launch.
+  private let escalateToSafeMode: SafeModeEscalator?
+  /// How many launches in a row one release has already failed.
+  private let strikes: BootStrikeLedger
   /// Single flight. Two windows can both press the button, and two upgrades interleaving
   /// their activation and their rollback would produce a state neither of them wrote.
   private var isRunning = false
@@ -60,22 +83,30 @@ public actor HarnessUpgradeCoordinator {
     installer: HarnessInstaller,
     pending: PendingUpgradeStore? = nil,
     reports: UpgradeReportStore? = nil,
+    strikes: BootStrikeLedger? = nil,
     profile: String,
     stopRuntime: @escaping RuntimeStopper,
     startRuntime: @escaping RuntimeStarter,
     currentRuntime: @escaping RuntimeProbe,
     makeChecks: @escaping CheckFactory,
+    preflight: (any PluginPreflighting)? = nil,
+    bootHealth: BootHealthFactory? = nil,
+    escalateToSafeMode: SafeModeEscalator? = nil,
     progress: @escaping ProgressReporter = { _ in }
   ) {
     self.paths = paths
     self.installer = installer
     self.pending = pending ?? PendingUpgradeStore(paths: paths)
     self.reports = reports ?? UpgradeReportStore(paths: paths)
+    self.strikes = strikes ?? BootStrikeLedger(paths: paths)
     self.profile = profile
     self.stopRuntime = stopRuntime
     self.startRuntime = startRuntime
     self.currentRuntime = currentRuntime
     self.makeChecks = makeChecks
+    self.preflight = preflight
+    self.bootHealth = bootHealth
+    self.escalateToSafeMode = escalateToSafeMode
     self.progress = progress
   }
 
@@ -99,6 +130,11 @@ public actor HarnessUpgradeCoordinator {
     }
     isRunning = true
     defer { isRunning = false }
+    // A person choosing a version is the authority on whether it is worth another try, so the
+    // consecutive-failure counts are not evidence against what happens next. Leaving them would
+    // make the first failure of this attempt look like the third, and the ladder would skip
+    // straight to Safe Mode on an upgrade the user just asked for.
+    strikes.clearAll()
     return await perform(target: target)
   }
 
@@ -178,6 +214,13 @@ public actor HarnessUpgradeCoordinator {
       ))
     }
 
+    var tracker = QuarantineTracker(profile: profile)
+    // The pre-upgrade look, taken before the active pointer moves so the working version is
+    // still the one a repair would run against. This is the step that turns "the new release
+    // boots with your plugins quietly skipped" into "two plugins were already out of the way
+    // when it booted".
+    let preflightNotes = await runPreflight(target: target, tracker: &tracker)
+
     progress("Activating \(target)…")
     do {
       try await installer.activate(target)
@@ -189,7 +232,9 @@ public actor HarnessUpgradeCoordinator {
         fromReleaseID: fromID,
         toReleaseID: target,
         outcome: .aborted,
-        summary: "激活 \(target) 失败，未启动；旧版本 \(fromID) 仍在：\(describe(error))"
+        summary: "激活 \(target) 失败，未启动；旧版本 \(fromID) 仍在：\(describe(error))",
+        notes: preflightNotes,
+        pluginQuarantined: tracker.quarantined.isEmpty ? nil : tracker.quarantined
       ))
     }
 
@@ -197,7 +242,8 @@ public actor HarnessUpgradeCoordinator {
     progress("Restarting the harness on \(target)…")
     await stopRuntime()
 
-    let announced: String
+    var notes = preflightNotes
+    let recovery: RecoveryOutcome
     do {
       let state = try await startRuntime()
       guard state.phase == .running, let url = state.url, !url.isEmpty else {
@@ -206,40 +252,264 @@ public actor HarnessUpgradeCoordinator {
           detail: state.detail ?? "harness 未报告监听地址"
         )
       }
-      announced = url
+      recovery = await assessBoot(announcedURL: url, target: target, tracker: &tracker, notes: &notes)
     } catch {
-      let detail = describe(error)
-      return await rollBack(
-        from: fromID,
-        failedTarget: target,
-        bootFailure: detail,
-        reason: "启动失败",
-        checks: [Self.failedBootResult(detail)]
+      recovery = await repairFailedBoot(
+        failure: describe(error),
+        target: target,
+        tracker: &tracker,
+        notes: &notes
       )
     }
 
-    progress("Checking the new runtime…")
-    pending.advance(to: .verifying)
-    let checks = await verify(announcedURL: announced)
-    let blocking = checks.filter { $0.isBlocking && $0.verdict == .fail }
-    guard blocking.isEmpty else {
-      return await rollBack(
+    switch recovery {
+    case .unrepaired(let bootFailure, let reason):
+      return await concludeUnrepaired(
         from: fromID,
         failedTarget: target,
-        bootFailure: nil,
-        reason: "关键自检未通过（\(blocking.map(\.name).joined(separator: ", "))）",
-        checks: checks
+        bootFailure: bootFailure,
+        reason: reason,
+        tracker: tracker,
+        notes: notes
       )
-    }
 
-    pending.clear()
-    return finish(UpgradeReport(
-      fromReleaseID: fromID,
-      toReleaseID: target,
-      outcome: .kept,
-      summary: "\(target) 已启用并通过自检\(concernSuffix(checks))",
-      checks: checks
-    ))
+    case .working(let health):
+      if health.verdict == .degraded {
+        // Still degraded after a repair round. Reported as a check result rather than only a
+        // note, so `plugins` in the saved report says what the window banner says.
+        notes.append("隔离后启动输出仍有插件问题：" + health.summary)
+      }
+      progress("Checking the new runtime…")
+      pending.advance(to: .verifying)
+      guard let announced = await currentRuntimeURL() else {
+        return await rollBack(
+          from: fromID,
+          failedTarget: target,
+          bootFailure: nil,
+          reason: "启动后没有可用的地址",
+          checks: [],
+          tracker: tracker,
+          notes: notes
+        )
+      }
+      let checks = await verify(announcedURL: announced)
+      let blocking = checks.filter { $0.isBlocking && $0.verdict == .fail }
+      guard blocking.isEmpty else {
+        // A blocking check failure is not a plugin story: the endpoints, the session list, or
+        // the address itself is what is wrong. Rolling back is the honest outcome, and the
+        // quarantine that was already performed stays recorded so it is not a mystery later.
+        return await rollBack(
+          from: fromID,
+          failedTarget: target,
+          bootFailure: nil,
+          reason: "关键自检未通过（\(blocking.map(\.name).joined(separator: ", "))）",
+          checks: checks,
+          tracker: tracker,
+          notes: notes
+        )
+      }
+
+      pending.clear()
+      strikes.clear(target)
+      return finish(UpgradeReport(
+        fromReleaseID: fromID,
+        toReleaseID: target,
+        outcome: .kept,
+        summary: "\(target) 已启用并通过自检"
+          + concernSuffix(checks)
+          + quarantineSuffix(tracker),
+        checks: checks,
+        notes: notes,
+        pluginPreflight: tracker.findings.isEmpty ? nil : tracker.findings,
+        pluginQuarantined: tracker.quarantined.isEmpty ? nil : tracker.quarantined
+      ))
+    }
+  }
+
+  // MARK: - The recovery ladder
+
+  /// What one boot attempt, plus whatever repair it needed, concluded.
+  private enum RecoveryOutcome {
+    /// A runtime is up and the profile under it is intact.
+    case working(HarnessBootHealth)
+    /// Nothing that was tried produced a runtime, or the one that came up would not verify.
+    case unrepaired(bootFailure: String?, reason: String)
+  }
+
+  /// What one recovery step is allowed to do, and what it accrues.
+  ///
+  /// A value carried through the ladder rather than four separate locals, because every step
+  /// has to add to the same list: the report is what turns "the app quietly disabled two
+  /// plugins" into something the user can undo.
+  private struct QuarantineTracker {
+    var profile: String
+    var quarantined: [String] = []
+    var findings: [String: String] = [:]
+
+    mutating func add(_ names: [String]) {
+      for name in names where !quarantined.contains(name) {
+        quarantined.append(name)
+      }
+      quarantined.sort()
+    }
+  }
+
+  /// Probe the target release's ability to load the profile's plugins, and take the ones that
+  /// cannot out of the picture before the switch.
+  private func runPreflight(target: String, tracker: inout QuarantineTracker) async -> [String] {
+    guard let preflight else { return [] }
+    progress("Preflight: loading \(profile)'s plugins under \(target)…")
+    let result = await preflight.findUnloadable(profile: profile, releaseID: target)
+    for (name, reason) in result.unloadable.sorted(by: { $0.key < $1.key }) {
+      tracker.findings[name] = reason
+    }
+    guard !result.unloadable.isEmpty else {
+      let line = result.notes.isEmpty ? "Preflight: nothing to quarantine." : "Preflight: \(result.notes.joined(separator: "；"))"
+      progress(line)
+      return result.notes
+    }
+    let names = result.unloadable.keys.sorted()
+    progress("Preflight: \(names.count) plugin(s) cannot load under \(target): \(names.joined(separator: ", "))")
+    let disabled = await preflight.quarantine(names, profile: profile, releaseID: target)
+    tracker.add(disabled)
+    progress("Preflight: turned off \(disabled.joined(separator: ", ")) before switching.")
+    return result.notes
+  }
+
+  /// Read what the boot's output says, and repair it once when it says a plugin is missing.
+  ///
+  /// One round, deliberately: a boot costs a port and up to two minutes, and an upgrade that
+  /// chained them would be a hang. The rest of the ladder is the next launch's business.
+  private func assessBoot(
+    announcedURL: String,
+    target: String,
+    tracker: inout QuarantineTracker,
+    notes: inout [String]
+  ) async -> RecoveryOutcome {
+    guard let bootHealth else {
+      return .working(HarnessBootHealth(isRunning: true))
+    }
+    let health = await bootHealth(announcedURL)
+    guard health.verdict == .degraded else {
+      return .working(health)
+    }
+    notes.append("启动输出报告插件问题：" + health.summary)
+
+    let names = health.attributedPluginNames
+    guard let preflight, !names.isEmpty else {
+      // Nothing proof-backed to act on. A degraded boot with no attributable name is reported,
+      // not repaired — disabling a guess is how a working plugin disappears by accident.
+      notes.append("启动有插件问题但没有可证实的包名，未自动隔离。")
+      return .working(health)
+    }
+    progress("Plugins missing from the boot: \(names.joined(separator: ", ")); turning them off and trying again…")
+    let disabled = await preflight.quarantine(names, profile: tracker.profile, releaseID: target)
+    tracker.add(disabled)
+    guard !disabled.isEmpty else {
+      notes.append("想隔离 \(names.joined(separator: ", ")) 但都没能写进 profile。")
+      return .working(health)
+    }
+    notes.append("已隔离启动输出指认的插件：\(disabled.joined(separator: ", "))")
+
+    await stopRuntime()
+    do {
+      let state = try await startRuntime()
+      guard state.phase == .running, let url = state.url, !url.isEmpty else {
+        return .unrepaired(bootFailure: state.detail, reason: "隔离插件后仍未报告监听地址")
+      }
+      let after = await bootHealth(url)
+      if after.verdict == .degraded {
+        notes.append("隔离后启动仍有插件问题：" + after.summary)
+      }
+      return .working(after)
+    } catch {
+      return .unrepaired(bootFailure: describe(error), reason: "隔离插件后启动失败")
+    }
+  }
+
+  /// A boot that never came up: disable what the failure blames, boot again, and see.
+  private func repairFailedBoot(
+    failure: String,
+    target: String,
+    tracker: inout QuarantineTracker,
+    notes: inout [String]
+  ) async -> RecoveryOutcome {
+    guard let preflight else {
+      return .unrepaired(bootFailure: failure, reason: "启动失败")
+    }
+    let suspects = PluginFailureReader.suspects(in: failure, profile: profile, paths: paths)
+    guard !suspects.isEmpty else {
+      // Nothing in the output names a plugin, so this is not a plugin story. Guessing here
+      // would disable a working plugin and still not boot.
+      return .unrepaired(bootFailure: failure, reason: "启动失败")
+    }
+    progress("Boot failed and blamed \(suspects.joined(separator: ", ")); turning them off and trying again…")
+    let disabled = await preflight.quarantine(suspects, profile: tracker.profile, releaseID: target)
+    tracker.add(disabled)
+    guard !disabled.isEmpty else {
+      return .unrepaired(bootFailure: failure, reason: "启动失败，且没能把责任插件写进 profile")
+    }
+    notes.append("启动失败，已隔离：\(disabled.joined(separator: ", "))")
+
+    await stopRuntime()
+    do {
+      let state = try await startRuntime()
+      guard state.phase == .running, let url = state.url, !url.isEmpty else {
+        return .unrepaired(bootFailure: state.detail ?? failure, reason: "隔离插件后仍未报告监听地址")
+      }
+      if let bootHealth {
+        let health = await bootHealth(url)
+        if health.verdict == .degraded {
+          notes.append("抢救成功后启动仍有插件问题：" + health.summary)
+        }
+        return .working(health)
+      }
+      return .working(HarnessBootHealth(isRunning: true))
+    } catch {
+      return .unrepaired(bootFailure: describe(error), reason: "隔离插件后启动失败")
+    }
+  }
+
+  /// Nothing worked, on the path where the user asked for the upgrade.
+  ///
+  /// This one ends in a rollback and never in Safe Mode. The two are not interchangeable: a
+  /// rollback keeps the app running on the version that works and asks the user for nothing,
+  /// while Safe Mode is a restart they have to notice and act on. Safe Mode is the answer to
+  /// "the app will not come up again", which is a launch-time question — see
+  /// `recoverInterruptedUpgrade`.
+  private func concludeUnrepaired(
+    from fromID: String,
+    failedTarget: String,
+    bootFailure: String?,
+    reason: String,
+    tracker: QuarantineTracker,
+    notes: [String]
+  ) async -> UpgradeReport {
+    await rollBack(
+      from: fromID,
+      failedTarget: failedTarget,
+      bootFailure: bootFailure,
+      reason: reason,
+      checks: [],
+      tracker: tracker,
+      notes: notes
+    )
+  }
+
+  private static let safeModeArranged =
+    "下次启动会以安全模式（无插件）运行；Harness 菜单可退出安全模式。"
+
+  /// The address of whatever runtime is up right now.
+  private func currentRuntimeURL() async -> String? {
+    guard let state = await currentRuntime(), state.phase == .running, let url = state.url, !url.isEmpty else {
+      return nil
+    }
+    return url
+  }
+
+  /// `（已隔离 …）`, or nothing.
+  private func quarantineSuffix(_ tracker: QuarantineTracker) -> String {
+    tracker.quarantined.isEmpty ? "" : "（已隔离 \(tracker.quarantined.joined(separator: ", "))）"
   }
 
   /// Checks only, for a release that is already active. Never restarts anything.
@@ -309,15 +579,23 @@ public actor HarnessUpgradeCoordinator {
       ))
     }
 
+    // Active and up: verify it, and treat "up and intact" as the end of the story. This is the
+    // first branch because a release that works must never be punished for an earlier launch's
+    // failure — the strike ledger exists to stop a loop, not to keep score.
     guard let state = await currentRuntime(), state.phase == .running, let url = state.url, !url.isEmpty else {
-      // The new release is active and did not come up. One rollback attempt, no loop.
-      return await rollBack(
-        from: record.fromReleaseID,
-        failedTarget: record.toReleaseID,
-        bootFailure: "升级后首次启动未成功（标记停在 \(record.stage.rawValue)）",
-        reason: "启动失败",
-        checks: []
-      )
+      return await recoverInterruptedUpgrade(record: record, failure: "升级后首次启动未成功（标记停在 \(record.stage.rawValue)）")
+    }
+
+    if let bootHealth {
+      let health = await bootHealth(url)
+      if health.verdict == .degraded {
+        return await recoverInterruptedUpgrade(
+          record: record,
+          failure: "升级后启动成功但插件缺失：" + health.summary,
+          health: health,
+          announcedURL: url
+        )
+      }
     }
 
     // Active and up, but never verified: verify now and roll back only if a blocking check
@@ -325,16 +603,16 @@ public actor HarnessUpgradeCoordinator {
     let checks = await verify(announcedURL: url)
     let blocking = checks.filter { $0.isBlocking && $0.verdict == .fail }
     guard blocking.isEmpty else {
-      return await rollBack(
-        from: record.fromReleaseID,
-        failedTarget: record.toReleaseID,
-        bootFailure: nil,
-        reason: "关键自检未通过（\(blocking.map(\.name).joined(separator: ", "))）",
-        checks: checks
+      return await recoverInterruptedUpgrade(
+        record: record,
+        failure: "关键自检未通过（\(blocking.map(\.name).joined(separator: ", "))）",
+        checks: checks,
+        announcedURL: url
       )
     }
 
     pending.clear()
+    strikes.clear(record.toReleaseID)
     return finish(UpgradeReport(
       fromReleaseID: record.fromReleaseID,
       toReleaseID: record.toReleaseID,
@@ -342,6 +620,117 @@ public actor HarnessUpgradeCoordinator {
       summary: "上次中断的升级已确认完成：\(record.toReleaseID) 自检通过\(concernSuffix(checks))",
       checks: checks
     ))
+  }
+
+  // MARK: - The launch-time ladder
+
+  /// One unhealthy launch of the release an interrupted upgrade moved to.
+  ///
+  /// This is the branch that makes an unattended recovery possible at all. The upgrade that
+  /// first failed is over — the app is running the new release and it does not work — and the
+  /// only thing standing between the user and a hand-repair is whether this decides to try the
+  /// same repair the upgrade path would have.
+  ///
+  /// The decision is by consecutive-failure count, and the counts mean different things:
+  ///
+  /// - **first**: repair what can be repaired, and otherwise do what the app has always done —
+  ///   put the previous release back and boot it. A rollback needs no restart, so it is the
+  ///   right first answer for a user who is looking at the screen.
+  /// - **second**: the rollback did not stick, or the user came back to the same broken
+  ///   release. Repair again, and when that fails, arrange a Safe Mode launch — a rollback
+  ///   loops between two versions when the home itself is what is wrong, and Safe Mode is the
+  ///   answer to "the app must still open".
+  /// - **third and beyond**: stop acting. The app is not going to repair this one, and
+  ///   escalating forever would hide which release is actually broken.
+  private func recoverInterruptedUpgrade(
+    record: PendingUpgradeRecord,
+    failure: String,
+    health: HarnessBootHealth? = nil,
+    checks: [HarnessCheckResult] = [],
+    announcedURL: String? = nil
+  ) async -> UpgradeReport {
+    _ = announcedURL
+    let strikesForRelease = strikes.recordStrike(
+      forReleaseID: record.toReleaseID,
+      stage: record.stage.rawValue
+    )
+
+    if strikesForRelease >= BootStrikeLedger.escalationLimit {
+      return finish(UpgradeReport(
+        fromReleaseID: record.fromReleaseID,
+        toReleaseID: record.toReleaseID,
+        outcome: .aborted,
+        summary: "\(record.toReleaseID) 连续 \(strikesForRelease) 次启动未通过；"
+          + "不再自动尝试，建议回退到 \(record.fromReleaseID)（控制台可一键切回）。",
+        bootFailure: failure,
+        checks: checks,
+        notes: [Self.markerKept]
+      ))
+    }
+
+    var tracker = QuarantineTracker(profile: record.profile)
+    var notes: [String] = []
+    let names = health?.attributedPluginNames
+      ?? PluginFailureReader.suspects(in: failure, profile: record.profile, paths: paths)
+
+    if let preflight, !names.isEmpty {
+      progress("A release that failed to start blames \(names.joined(separator: ", ")); turning them off…")
+      let disabled = await preflight.quarantine(names, profile: record.profile, releaseID: record.toReleaseID)
+      tracker.add(disabled)
+      if !disabled.isEmpty {
+        notes.append("隔离后重试：\(disabled.joined(separator: ", "))")
+        await stopRuntime()
+        if let state = try? await startRuntime(),
+           state.phase == .running, let url = state.url, !url.isEmpty {
+          let afterChecks = await verify(announcedURL: url)
+          let blocking = afterChecks.filter { $0.isBlocking && $0.verdict == .fail }
+          if blocking.isEmpty {
+            pending.clear()
+            strikes.clear(record.toReleaseID)
+            return finish(UpgradeReport(
+              fromReleaseID: record.fromReleaseID,
+              toReleaseID: record.toReleaseID,
+              outcome: .kept,
+              summary: "\(record.toReleaseID) 启动失败后已隔离 \(disabled.joined(separator: ", ")) 并通过自检。",
+              checks: afterChecks,
+              notes: notes,
+              pluginQuarantined: disabled
+            ))
+          }
+          notes.append("隔离后自检仍未过：\(blocking.map(\.name).joined(separator: ", "))")
+        } else {
+          notes.append("隔离后仍然起不来。")
+        }
+      }
+    }
+
+    // The repair did not produce a working runtime. On the first failure the answer is the one
+    // the app has always given; only a *repeat* failure, which a rollback could not explain
+    // away, turns into Safe Mode.
+    if strikesForRelease >= 2,
+       let escalateToSafeMode,
+       await escalateToSafeMode("\(record.toReleaseID) 连续 \(strikesForRelease) 次未通过体检：\(failure)") {
+      return finish(UpgradeReport(
+        fromReleaseID: record.fromReleaseID,
+        toReleaseID: record.toReleaseID,
+        outcome: .aborted,
+        summary: "\(record.toReleaseID) 连续 \(strikesForRelease) 次未通过体检；已安排以安全模式重启（无插件）。",
+        bootFailure: failure,
+        checks: checks,
+        notes: notes + [Self.safeModeArranged, Self.markerKept],
+        pluginQuarantined: tracker.quarantined.isEmpty ? nil : tracker.quarantined
+      ))
+    }
+
+    return await rollBack(
+      from: record.fromReleaseID,
+      failedTarget: record.toReleaseID,
+      bootFailure: failure,
+      reason: "启动或自检未通过",
+      checks: checks,
+      tracker: tracker,
+      notes: notes
+    )
   }
 
   // MARK: - Rolling back
@@ -353,8 +742,23 @@ public actor HarnessUpgradeCoordinator {
     failedTarget: String,
     bootFailure: String?,
     reason: String,
-    checks: [HarnessCheckResult]
+    checks: [HarnessCheckResult],
+    tracker: QuarantineTracker? = nil,
+    notes: [String] = [],
+    extraNotes: [String] = []
   ) async -> UpgradeReport {
+    let carriedNotes = notes + extraNotes
+    let quarantined = tracker?.quarantined ?? []
+    let findings = tracker?.findings ?? [:]
+    // The failing boot is itself a check result, and it is the only one that exists when the
+    // process never announced an address. Dropping it would leave the report with a reason but
+    // no evidence, and the report is what the user reads.
+    let allChecks: [HarnessCheckResult]
+    if checks.isEmpty, let bootFailure {
+      allChecks = [Self.failedBootResult(bootFailure)]
+    } else {
+      allChecks = checks
+    }
     progress("Rolling back to \(fromID)…")
     do {
       try await installer.activate(fromID)
@@ -368,8 +772,10 @@ public actor HarnessUpgradeCoordinator {
         summary: "回退失败：无法激活 \(fromID)（\(describe(error))）。"
           + "请用 Harness Console 手动选版本，或进入安全模式。",
         bootFailure: bootFailure,
-        checks: checks,
-        notes: [Self.markerKept]
+        checks: allChecks,
+        notes: carriedNotes + [Self.markerKept],
+        pluginPreflight: findings.isEmpty ? nil : findings,
+        pluginQuarantined: quarantined.isEmpty ? nil : quarantined
       ))
     }
 
@@ -384,20 +790,30 @@ public actor HarnessUpgradeCoordinator {
         summary: "新旧版本都起不来：\(failedTarget) \(reason)，回退到 \(fromID) 也失败。"
           + "请进入安全模式或干净环境。",
         bootFailure: bootFailure,
-        checks: checks,
-        notes: ["回退启动失败：\(describe(error))", Self.markerKept]
+        checks: allChecks,
+        notes: carriedNotes + ["回退启动失败：\(describe(error))", Self.markerKept],
+        pluginPreflight: findings.isEmpty ? nil : findings,
+        pluginQuarantined: quarantined.isEmpty ? nil : quarantined
       ))
     }
 
     pending.clear()
+    // The count for the failed release deliberately stays. A rollback undoes the *switch*, not
+    // the evidence: if this version is activated again — by the user, or by the next launch of
+    // a half-finished upgrade — it should be met with the knowledge that it already failed
+    // once, rather than starting from zero and going through the whole ladder again.
     return finish(UpgradeReport(
       fromReleaseID: fromID,
       toReleaseID: failedTarget,
       rolledBackTo: fromID,
       outcome: .rolledBack,
-      summary: "\(failedTarget) \(reason)，已自动回退到 \(fromID)。",
+      summary: "\(failedTarget) \(reason)，已自动回退到 \(fromID)。"
+        + (quarantined.isEmpty ? "" : "（隔离记录已保留：\(quarantined.joined(separator: ", "))）"),
       bootFailure: bootFailure,
-      checks: checks
+      checks: allChecks,
+      notes: carriedNotes,
+      pluginPreflight: findings.isEmpty ? nil : findings,
+      pluginQuarantined: quarantined.isEmpty ? nil : quarantined
     ))
   }
 

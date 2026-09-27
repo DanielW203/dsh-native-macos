@@ -129,13 +129,21 @@ public struct HarnessInvocation: Sendable {
     arguments: [String] = [],
     currentDirectory: URL,
     timeout: TimeInterval = 120,
-    label: String
+    label: String,
+    harnessEntry: URL? = nil
   ) async throws -> ProcessRequest {
     let toolchain = try await toolchainResolver.resolve()
+    var environment = toolchainResolver.harnessEnvironment(for: toolchain)
+    // An import check against a release that is not the active one still has to run with that
+    // release in mind. The entry point is the one piece of it this app has to hand over:
+    // everything else the plugin resolves comes out of the profile's own tree.
+    if let harnessEntry {
+      environment["DSH_HARNESS_ENTRY"] = harnessEntry.path
+    }
     return ProcessRequest(
       executable: toolchain.node,
       arguments: ["--input-type=module", "-e", script] + arguments,
-      environment: toolchainResolver.harnessEnvironment(for: toolchain),
+      environment: environment,
       currentDirectory: currentDirectory,
       timeout: timeout,
       label: label

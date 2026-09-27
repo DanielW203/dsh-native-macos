@@ -310,6 +310,10 @@ public actor ProfileImporter {
   private let inspector: ArchiveInspector
   private let invocation: HarnessInvocation
   private let entryProvider: @Sendable () async throws -> URL
+  /// Resolves another installed release's entry point, for the pre-upgrade load probe. The
+  /// active release's entry is still `entryProvider`; this exists only so a probe can ask
+  /// about a version that is not active yet.
+  private let releaseProvider: any ReleaseEntryProviding
 
   /// Names that are never copied, whatever they are.
   ///
@@ -332,14 +336,26 @@ public actor ProfileImporter {
     paths: RuntimePaths,
     entryProvider: @escaping @Sendable () async throws -> URL,
     runner: ProcessRunning = ProcessRunner(),
-    baseEnvironment: [String: String] = ProcessInfo.processInfo.environment
+    baseEnvironment: [String: String] = ProcessInfo.processInfo.environment,
+    releaseProvider: (any ReleaseEntryProviding)? = nil
   ) {
     self.paths = paths
     self.entryProvider = entryProvider
     self.runner = runner
     self.baseEnvironment = baseEnvironment
+    self.releaseProvider = releaseProvider
+      ?? HarnessInstaller(paths: paths, runner: runner)
     self.inspector = ArchiveInspector(runner: runner)
     self.invocation = HarnessInvocation(paths: paths, runner: runner, baseEnvironment: baseEnvironment)
+  }
+
+  /// The declared package names of one profile, sorted.
+  ///
+  /// Extracted from `knownPluginNames` because the load probe needs the same answer from
+  /// outside this actor, and two copies of "read the manifest, take the dependency keys"
+  /// would eventually disagree about which of them is authoritative.
+  func declaredPluginNames(profile: String) async throws -> [String] {
+    try await knownPluginNames(profile: profile)
   }
 
   // MARK: - Homes
@@ -937,26 +953,28 @@ public actor ProfileImporter {
   ///
   /// Only names that exist in the profile are returned: a guess must never cause the console
   /// to disable something that was not to blame.
+  ///
+  /// **The shapes were once read here, and no longer are.** They live in
+  /// `HarnessBootLineScanner` now, which also reads the shapes 0.1.7 introduced
+  /// (`skipping profile bundle …`) — the ones this function could not see, so a boot with
+  /// missing plugins was reported as healthy. What stays here is the part that is this
+  /// type's business: only a name the profile declares may be acted on.
   static func pluginSuspects(in diagnostic: String, profile: String, known: Set<String>) -> [String] {
     guard !known.isEmpty else { return [] }
+    let lines = diagnostic.components(separatedBy: "\n")
+    let problems = HarnessBootLineScanner.scan(lines: lines, profile: profile, known: known)
     var suspects: Set<String> = []
-
-    let marker = "/profiles/\(profile)/node_modules/"
-    for line in diagnostic.components(separatedBy: "\n") {
-      if let range = line.range(of: marker) {
-        let remainder = line[range.upperBound...]
-        let components = remainder.split(separator: "/", omittingEmptySubsequences: false)
-        if let first = components.first {
-          var name = String(first)
-          if name.hasPrefix("@"), components.count > 1 {
-            name += "/" + String(components[1])
-          }
-          if known.contains(name) { suspects.insert(name) }
-        }
-      }
-      if let range = line.range(of: "failed to apply loader entry ") {
-        let token = line[range.upperBound...].prefix { $0 != " " && $0 != "(" && $0 != ":" && $0 != "\"" }
-        if known.contains(String(token)) { suspects.insert(String(token)) }
+    for problem in problems where problem.isAttributed && !problem.name.isEmpty {
+      suspects.insert(problem.name)
+    }
+    // A name the output gave that this profile does not declare still counts when it is the
+    // only thing the output names: it is what the pre-0.1.7 parser already returned, and
+    // dropping it would take away the one lead a failing boot left behind. The empty name of
+    // a bare `N entry did not activate` count line is dropped here — there is nothing to
+    // disable by that name.
+    if suspects.isEmpty {
+      for problem in problems where !problem.isAttributed && !problem.name.isEmpty {
+        suspects.insert(problem.name)
       }
     }
     return suspects.sorted()
@@ -1030,6 +1048,20 @@ public actor ProfileImporter {
   /// and loading it costs a second, where a boot costs a port and a failure the user sees
   /// before the UI ever appears.
   public func importFailures(profile: String, names: [String]) async throws -> [String: String] {
+    try await importFailures(profile: profile, names: names, entry: nil)
+  }
+
+  /// The same check, against a chosen release rather than the active one.
+  ///
+  /// - Parameter entry: the CLI entry point to import *through*. `nil` means the active
+  ///   release. This is what makes a pre-upgrade probe possible: it asks "would these plugins
+  ///   load under the version I have not switched to yet", which the active-release-only form
+  ///   cannot answer.
+  public func importFailures(
+    profile: String,
+    names: [String],
+    entry: URL?
+  ) async throws -> [String: String] {
     guard !names.isEmpty else { return [:] }
     let directory = paths.profilesDirectory.appendingPathComponent(profile, isDirectory: true)
     let request = try await invocation.nodeRequest(
@@ -1037,7 +1069,8 @@ public actor ProfileImporter {
       arguments: names,
       currentDirectory: directory,
       timeout: 180,
-      label: "import check for \(profile)"
+      label: "import check for \(profile)",
+      harnessEntry: entry
     )
     let result = try await runner.run(request, onLine: nil)
 

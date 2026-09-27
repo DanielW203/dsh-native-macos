@@ -484,14 +484,18 @@ final class ProfileImporterTests: XCTestCase {
       ["@sjhmars/pi-ai-thinking"]
     )
 
-    // Nothing that is not in this profile may be named: the caller disables what is returned.
-    XCTAssertTrue(
+    // A name this profile does not declare is still what the output named, and the caller has
+    // already decided the boot will not come up, so it is kept as a lead — the same behaviour
+    // this function had before the boot-output parser was shared.
+    XCTAssertEqual(
       ProfileImporter.pluginSuspects(
         in: "at file:///x/profiles/web/node_modules/some-other-plugin/lib/index.js:1",
         profile: "web",
         known: known
-      ).isEmpty
+      ),
+      ["some-other-plugin"]
     )
+    // What must never happen is a guess with no name in the output at all.
     XCTAssertTrue(ProfileImporter.pluginSuspects(in: "plain failure", profile: "web", known: known).isEmpty)
   }
 

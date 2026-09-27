@@ -100,6 +100,16 @@ public struct UpgradeReport: Codable, Sendable, Equatable {
   public var checks: [HarnessCheckResult]
   /// Extra context that does not belong in `summary` — a second failure, a cleared marker.
   public var notes: [String]
+  /// What the pre-upgrade load probe found, by package name, for the release being moved to.
+  ///
+  /// Optional and decode-tolerant on purpose: reports written before the probe existed have
+  /// no such key, and an absent key must mean "not probed" rather than a decode failure.
+  public var pluginPreflight: [String: String]?
+  /// The plugins the app turned off to get this upgrade to conclude, sorted.
+  ///
+  /// This is the field that makes the difference between "kept" and "kept with two features
+  /// quietly missing" visible after the fact.
+  public var pluginQuarantined: [String]?
 
   public init(
     schemaVersion: Int = UpgradeReport.currentSchemaVersion,
@@ -111,7 +121,9 @@ public struct UpgradeReport: Codable, Sendable, Equatable {
     summary: String,
     bootFailure: String? = nil,
     checks: [HarnessCheckResult] = [],
-    notes: [String] = []
+    notes: [String] = [],
+    pluginPreflight: [String: String]? = nil,
+    pluginQuarantined: [String]? = nil
   ) {
     self.schemaVersion = schemaVersion
     self.fromReleaseID = fromReleaseID
@@ -123,6 +135,14 @@ public struct UpgradeReport: Codable, Sendable, Equatable {
     self.bootFailure = bootFailure
     self.checks = checks
     self.notes = notes
+    self.pluginPreflight = pluginPreflight
+    self.pluginQuarantined = pluginQuarantined
+  }
+
+  /// The quarantine sentence for a summary or a banner, or nothing when nothing was disabled.
+  public var quarantineNote: String? {
+    guard let pluginQuarantined, !pluginQuarantined.isEmpty else { return nil }
+    return "已隔离 \(pluginQuarantined.count) 个插件：\(pluginQuarantined.joined(separator: ", "))"
   }
 
   /// Blocking checks that failed — the ones a rollback is justified by.

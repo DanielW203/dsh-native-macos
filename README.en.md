@@ -28,6 +28,9 @@ versions, provisioning Node and managing plugins are all the app's job — open 
   which approvals and questions go there, a running desktop turn streams its own text paragraphs in
   throttled batches, and each turn end adds the result — text that already went out is not repeated
 - **Plugin management**: install / remove / import / repair profile plugins, with a compatibility verdict per plugin
+- **Skin manager**: a native window that lists the installed skins, switches between them in one click, and goes
+  back to the stock look; it rewrites the harness's own `cordis.patch.yml` and takes effect through hot reload,
+  replacing web plugins such as `dsh-skin-manager`
 - **Safe start and recovery**: two levels of escape — drop the plugins first, then the whole home — plus a recovery window that can roll configuration back
 - **Local only**: everything lives under your own home directory; no telemetry, no account
 
@@ -109,10 +112,35 @@ history copy under `~/.nativeharness/harness/upgrade-reports/`.
 | `events-stream` | `$events` connects and delivers a ready frame | No |
 | `turn-follow` | A turn's snapshot frame can be followed | No |
 | `tool-vocabulary` | Every announced tool name is known to this app | No |
-| `plugins` | No conflicting declarations among installed plugins | No |
+| `plugins` | No conflicting declarations among installed plugins **and no "plugin did not load" in the new version's boot output** | No |
 
 **A blocking failure puts the old version straight back**, and the reason (failed boot / which checks did not
 pass) is written into the report and shown in the UI.
+
+**"It connects" is not "the plugins are there".** Since 0.1.7 that distinction matters: the new plugin loader
+*skips* bundles it considers incompatible and boots anyway. The process is alive, the address is announced, all
+eight checks pass — and the user's plugins are missing. So the self-check now also reads the boot output itself:
+`skipping profile bundle`, `N entry did not activate` and `<pkg>: failed to import` are parsed into "plugins that
+did not load on this version", reported in `plugins` and in a banner on the main window.
+
+### 2b. An upgrade you do not have to click through: preflight → quarantine → retry → safe mode
+
+| Phase | What the app does | What you do |
+|---|---|---|
+| **Preflight** | Before switching, import every plugin under the *target* release's entry point; disable the ones that fail (recorded in `native-plugin-state.json` with the release id in the reason) | nothing |
+| **Boot** | Start normally; on a failed boot, disable the packages the output blames and boot once more | nothing |
+| **Health** | If it came up but its output reports missing plugins, quarantine the provable ones and boot again; anything left is reported in the report and a banner | nothing |
+| **Retry** | The upgrade path retries once (never in a loop) and otherwise rolls back to the working version | nothing |
+| **Across launches** | Next launch finds the new release still down: first failure rolls back; second writes a Safe Mode marker and restarts; third stops acting and suggests a rollback | you see the app open in Safe Mode on the second |
+
+Quarantines are reversible: the Plugins window and "Plugin Compatibility…" both say "quarantined by the app for
+0.1.7-rc.1", and one button puts it back and restarts. The record is scoped to **that release** — plugins you
+turned off yourself are never re-enabled by it. The compatibility window also has a **Load-test** button that
+actually imports every plugin under the current version and offers to quarantine the failures.
+
+The evidence is two files on your machine: `pluginPreflight` / `pluginQuarantined` in
+`~/.nativeharness/harness/upgrade-report.json`, and the consecutive-failure counts in
+`~/.nativeharness/harness/boot-strikes.json`.
 
 ### 3. Switch back to an older version whenever something breaks
 
@@ -128,7 +156,21 @@ pass) is written into the report and shown in the UI.
   means "install and activate only — no restart, no checks", and **Activate** means "switch the version only — no
   restart, no checks".
 
-### 4. A real case: the 0.1.6-alpha.2 upgrade was blocked by an old plugin
+### 4. Two real cases
+
+#### Updating to 0.1.7-rc.1: the self-check "passed" while the plugins did not load
+
+On 2026-09-24 the app moved to `0.1.7-rc.1`. It booted, `boot` and `rpc-endpoints` passed — and the same boot
+printed `dsh: warning: 1 entry did not activate`, `web-search-free (dsh-free-search): failed to import`, and a
+dozen `skipping profile bundle "dsh-memoir" ...` lines. The app called it "updated and passing", so the next
+fifteen minutes were manual: two app restarts, disabling `dsh-skin-manager`, switching back to 0.1.6, disabling
+`dsh-token-optimizer`, switching forward again.
+
+That path is now: preflight finds `dsh-memoir` / `dsh-free-search` cannot load → they are quarantined before the
+switch → it boots → the `plugins` check says "2 plugins did not load on this version" → the report and the window
+banner say which. **No step needs a button.**
+
+#### The 0.1.6-alpha.2 upgrade was blocked by an old plugin
 
 Updating from **0.1.6-alpha.1** to **0.1.6-alpha.2**, the harness did not come up and the error pointed at a plugin
 that failed to load under the new version. The plugin loader has no per-plugin isolation, so one unsupported plugin
@@ -219,6 +261,49 @@ neither comes up → an app-side problem (the recovery window gives the verdict)
 and repair, **configuration rollback** (a declarative config snapshot is taken after every confirmed listen; restore
 previews first and stops the harness), and data and diagnostics. In safe mode the WeChat channel does not start and
 plugin-related menu items are disabled.
+
+## Skin manager
+
+**Harness ▸ 皮肤管理器…** (⇧⌘K) lists every skin installed in the selected profile and switches between
+them in one click; **官方默认** returns to DeepSeek Harness' own appearance.
+
+**Why a native window instead of the web plugin.** A skin is what the Web UI *is*: with a skin that renders
+badly, the first thing to fail is its own settings page — so the control for changing it cannot live inside the
+page it changes. The skin switch therefore sits in the menu bar, beside the plugin windows.
+
+**What it does.** A switch rewrites the managed section of the profile's `cordis.patch.yml`, marked by
+`# --- dsh-skin-manager managed (auto-generated; do not edit) ---`: the chosen skin gets an `- insert:` row
+(unless its bundle layer already wires it), every other skin gets `- id: <rowId>` plus `disabled: true`. The
+profile declares `patchReload: live`, so a running harness hot-reloads within seconds and **重载页面** in the
+window shows the new skin — no restart, no second server.
+
+| Capability | Detail |
+|---|---|
+| Discovery | scans `node_modules`: packages with a `skin.json`, plus market themes without one (a client bundle and an `insert:` row, identified by their name, row id, or "immediately loaded + described as a theme") |
+| Scope | top-level packages and **every** `@scope`, plus `<package>/skins/<id>` inside aggregate packages |
+| Exclusivity | exactly one skin is active; every other one is written as `disabled: true` |
+| Truth | the active skin is read back from the patch file rather than remembered elsewhere — the file is what the loader reads |
+| Previews | read straight from the package's `preview.light/dark`, following the window's appearance; no HTTP involved |
+| Market | syncs the `disabled` list in `.dsh-market/state.json`, and only that key — region, groups and notes are carried through |
+| Replaces | detects `dsh-skin-manager` and friends, and offers a one-click, reversible disable (removal from `dsh.profile.bundles`) |
+
+The managed markers are byte-identical to the plugin's, which is the handover protocol: this window recognises
+and replaces a block the plugin wrote (so two writers never fight over it), and a user who goes back to the
+plugin finds a block it still understands. Compared with `dsh-skin-manager` 0.1.6/0.1.7, this fixes:
+
+1. **Only one scope scanned** — the plugin probed `node_modules/@`, which does not exist, so any skin under
+   `@yunxii` and friends was invisible and the current skin read as "not active";
+2. **The skin market disabled as if it were a skin** — the plugin's non-theme list omitted `dsh-skin-market`,
+   so every switch turned the market itself off;
+3. **`insert:` blocks carrying `config:` left behind** — only the id/name part was removed, leaving the rest;
+4. **Stale duplicate `disabled` rows** — this machine's profile literally carries three for one skin, which
+   would keep a freshly applied skin switched off;
+5. **A blank line added on every apply** — the block is rendered in a canonical form, so re-applying the same
+   skin is a byte-for-byte no-op instead of needlessly making the config watcher reload the plugin tree.
+
+Implementation: `Sources/HarnessRuntime/SkinCatalog.swift` (discovery),
+`Sources/HarnessRuntime/SkinManager.swift` (switching and patch surgery), and
+`Sources/HarnessConsoleUI/SkinManager{Model,Window}.swift` (the window).
 
 ## Building from source (developers)
 

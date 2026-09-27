@@ -27,11 +27,19 @@ public enum HarnessUpgradeChecks {
   /// Authentication happens once, here. The launch token is exchanged for a signed cookie by
   /// `authenticate`, and every check afterwards rides that one cookie — a per-check handshake
   /// would be both wasteful and, against a single-use token, wrong.
+  /// What the boot's own output said about the plugins, when the caller has it.
+  ///
+  /// A closure rather than a value because it is read once, after the handshake, and because a
+  /// caller with no boot output at all — a check run against a harness the app did not start —
+  /// must be able to say "no opinion" instead of "all fine".
+  public typealias BootHealthProvider = @Sendable () -> HarnessBootHealth?
+
   public static func make(
     announcedURL: String,
     paths: RuntimePaths,
     profile: String,
-    activeReleaseID: String?
+    activeReleaseID: String?,
+    bootHealth: BootHealthProvider? = nil
   ) async -> [any HarnessCheck] {
     let context: CheckContext
     do {
@@ -39,7 +47,8 @@ public enum HarnessUpgradeChecks {
         announcedURL: announcedURL,
         paths: paths,
         profile: profile,
-        activeReleaseID: activeReleaseID
+        activeReleaseID: activeReleaseID,
+        bootHealth: bootHealth
       )
     } catch {
       // A harness the app cannot even authenticate against is unusable, so this is the one
@@ -65,12 +74,14 @@ public enum HarnessUpgradeChecks {
     let paths: RuntimePaths
     let profile: String
     let activeReleaseID: String?
+    let bootHealth: BootHealthProvider?
 
     init(
       announcedURL: String,
       paths: RuntimePaths,
       profile: String,
-      activeReleaseID: String?
+      activeReleaseID: String?,
+      bootHealth: BootHealthProvider? = nil
     ) async throws {
       guard let url = URL(string: announcedURL) else {
         throw HarnessAPIError(code: .invalidURL, message: "harness 播报的地址无法解析：\(announcedURL)")
@@ -82,6 +93,7 @@ public enum HarnessUpgradeChecks {
       self.paths = paths
       self.profile = profile
       self.activeReleaseID = activeReleaseID
+      self.bootHealth = bootHealth
     }
 
     /// Sessions, newest activity first, or the error that stopped us asking.
@@ -484,25 +496,37 @@ private struct PluginCompatibilityCheck: HarnessCheck {
       paths: context.paths,
       entryProvider: { try await installer.activeEntryURL() }
     )
+    // What the boot itself reported comes first, because it is the stronger evidence: a
+    // declared range is a claim, while "this entry did not activate" is an observation. The
+    // 0.1.7 upgrade passed this check — the ranges it disagreed with were only a warning — and
+    // left two plugins unloaded, which is exactly the gap this line closes.
+    let missing = context.bootHealth?()?.attributedPluginNames ?? []
     do {
       let results = try store.compatibility(profile: context.profile, activeReleaseID: releaseID)
       let violations = results.filter {
         if case .incompatible = $0.verdict { return true }
         return false
       }
-      guard violations.isEmpty else {
+      var details: [String] = []
+      if !missing.isEmpty {
+        details.append("\(missing.count) 个插件在这个版本下没能加载：\(missing.joined(separator: ", "))")
+      }
+      if !violations.isEmpty {
         let named = violations.prefix(5).map(\.record.name).joined(separator: ", ")
+        details.append("\(violations.count) 个插件声明与新版本不符：\(named)")
+      }
+      guard !details.isEmpty else {
         return HarnessCheckResult(
           name: name,
-          verdict: .warn,
-          detail: "\(violations.count) 个插件声明与新版本不符：\(named)",
+          verdict: .pass,
+          detail: "\(results.count) 个插件没有声明冲突",
           isBlocking: isBlocking
         )
       }
       return HarnessCheckResult(
         name: name,
-        verdict: .pass,
-        detail: "\(results.count) 个插件没有声明冲突",
+        verdict: .warn,
+        detail: details.joined(separator: "；"),
         isBlocking: isBlocking
       )
     } catch {

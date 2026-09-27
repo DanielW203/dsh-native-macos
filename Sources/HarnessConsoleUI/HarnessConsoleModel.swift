@@ -104,6 +104,15 @@ public final class HarnessConsoleModel: ObservableObject {
   /// Why the audit could not run at all. A missing release is not such a reason: it leaves the
   /// engines claims unjudged on purpose, which is a normal state.
   @Published public private(set) var compatibilityFailure: String?
+  /// Plugins this app disabled to get a release to boot, for the selected profile.
+  ///
+  /// Kept beside the compatibility verdicts because the two answer the same user question —
+  /// "is this plugin working on this harness?" — from two directions: a declared range that
+  /// disagrees, and a disable the app already performed.
+  @Published public private(set) var quarantined: [QuarantinedPlugin] = []
+  /// The last real-load probe's result, keyed by nothing: it is about one release at a time.
+  @Published public private(set) var loadProbe: PluginLoadProbeResult?
+  @Published public private(set) var loadProbeReleaseID: String?
   /// Why the plugin list is empty, when the reason is a failure rather than an empty
   /// profile. A profile that has not been created yet is a normal state and leaves this
   /// `nil` — the window offers to create it instead of shouting.
@@ -358,6 +367,7 @@ public final class HarnessConsoleModel: ObservableObject {
 
   public func refreshPlugins() async {
     guard let pluginStore else { return }
+    quarantined = pluginStore.quarantinedPlugins(profile: selectedProfile)
     do {
       plugins = try await pluginStore.plugins(profile: selectedProfile)
       lastInstalled = await pluginStore.lastInstalledPlugin(profile: selectedProfile)
@@ -398,6 +408,66 @@ public final class HarnessConsoleModel: ObservableObject {
   /// The judgement for one plugin, or nil when the audit has not run for it.
   public func compatibility(for plugin: PluginRecord) -> PluginCompatibility? {
     compatibility[plugin.name]
+  }
+
+  /// The quarantine entry for one plugin, when the app is the one that disabled it.
+  public func quarantine(for plugin: PluginRecord) -> QuarantinedPlugin? {
+    quarantined.first { $0.name == plugin.name }
+  }
+
+  /// Actually load every plugin in the profile under a release, which is the only thing that
+  /// answers "will this work on the new version" — a declared range is a claim, and the audit
+  /// above only reads claims.
+  ///
+  /// Offered as an explicit button rather than run on every refresh: it costs one Node process
+  /// per plugin, and a console window that spawned twenty of them whenever it was opened would
+  /// be a worse neighbour than the problem it reports.
+  public func probePluginLoads(releaseID: String, quarantining: Bool = false) async {
+    guard let installer, let pluginStore else { return }
+    let probe = PluginLoadProbe(paths: paths, provider: installer)
+    await run("Loading \(selectedProfile)'s plugins under \(releaseID)") {
+      let result = await probe.probe(profile: self.selectedProfile, releaseID: releaseID)
+      self.loadProbe = result
+      self.loadProbeReleaseID = releaseID
+      for note in result.notes { self.append(.warning, note) }
+      guard !result.unloadable.isEmpty else {
+        self.append(.success, "没有插件加载失败（\(releaseID)）。")
+        return
+      }
+      let names = result.unloadable.keys.sorted()
+      self.append(.failure, "\(names.count) 个插件无法在 \(releaseID) 下加载：\(names.joined(separator: ", "))")
+      guard quarantining else { return }
+      let disabled = await PluginPreflight(probe: probe, store: pluginStore)
+        .quarantine(names, profile: self.selectedProfile, releaseID: releaseID)
+      self.quarantined = pluginStore.quarantinedPlugins(profile: self.selectedProfile)
+      self.append(
+        disabled.isEmpty ? .warning : .success,
+        disabled.isEmpty
+          ? "没能隔离任何插件：它们可能已不在 profile 的依赖里。"
+          : "已隔离：\(disabled.joined(separator: ", "))（可在插件窗口恢复）"
+      )
+      await self.refreshPlugins()
+    }
+  }
+
+  /// Put back everything quarantined for a release, and re-read the list.
+  public func restoreQuarantine(releaseID: String) async {
+    guard let pluginStore else { return }
+    do {
+      let restored = try await pluginStore.clearQuarantine(
+        profile: selectedProfile,
+        releaseID: releaseID
+      )
+      append(
+        restored.isEmpty ? .warning : .success,
+        restored.isEmpty
+          ? "没有针对 \(releaseID) 的隔离记录。"
+          : "已恢复并重新启用：\(restored.joined(separator: ", "))。重启 harness 后生效。"
+      )
+      await refreshPlugins()
+    } catch {
+      append(.failure, "恢复失败：\(describe(error))")
+    }
   }
 
   public func selectProfile(_ name: String) async {

@@ -27,6 +27,10 @@ public struct HarnessWebWindow: View {
 
   public var body: some View {
     VStack(spacing: 0) {
+      if model.isDegraded {
+        degradedBanner
+        Divider()
+      }
       if let banner {
         safeModeBanner(banner)
         Divider()
@@ -47,6 +51,49 @@ public struct HarnessWebWindow: View {
     .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
       Task { await model.refresh() }
     }
+  }
+
+  // MARK: - A harness that is up but incomplete
+
+  /// Says what the boot output said and nothing in the window would otherwise show.
+  ///
+  /// This is the banner for the failure that has no failure: the server is listening, the page
+  /// works, and two of the user's plugins are missing because the loader skipped them. Before
+  /// this, the only place that fact existed was a line in a log nobody reads.
+  private var degradedBanner: some View {
+    let problems = model.bootPluginProblems
+    let quarantined = model.quarantinedPlugins()
+    return HStack(alignment: .top, spacing: 10) {
+      Image(systemName: "puzzlepiece.extension")
+        .foregroundStyle(.yellow)
+      VStack(alignment: .leading, spacing: 2) {
+        Text("这个版本下没有加载上的插件（\(problems.count)）")
+          .font(.callout.weight(.medium))
+        Text(problems.joined(separator: ", "))
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+        if !quarantined.isEmpty {
+          Text("已隔离：\(quarantined.map(\.name).joined(separator: ", "))")
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+        }
+      }
+      Spacer(minLength: 12)
+      if !quarantined.isEmpty {
+        Button("恢复并重试") {
+          Task { await model.restoreQuarantinedPluginsAndRetry() }
+        }
+        .disabled(model.isBusy)
+        .help("把为这个版本隔离的插件放回 profile 并重新启动 harness")
+      }
+      Button("打开插件…") {
+        openWindow(id: HarnessWindowID.plugins)
+      }
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 10)
+    .background(Color.yellow.opacity(0.12))
   }
 
   // MARK: - Safe Mode

@@ -25,6 +25,10 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
     private var bootedStorage: [String] = []
     private var stopStorage = 0
     private var failures: [String: String] = [:]
+    /// How many more boots of a release will fail before it boots. A count rather than a flag
+    /// because the repair ladder exists to be *survived*: the same release has to be able to
+    /// fail once and then come up, or the test would be asserting a rollback.
+    private var remainingFailures: [String: Int] = [:]
     private var up = true
 
     init(installer: HarnessInstaller) {
@@ -43,10 +47,11 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
       return stopStorage
     }
 
-    func failBoot(of release: String, detail: String) {
+    func failBoot(of release: String, detail: String, times: Int = .max) {
       lock.lock()
       defer { lock.unlock() }
       failures[release] = detail
+      remainingFailures[release] = times
     }
 
     func setRunning(_ running: Bool) {
@@ -59,7 +64,14 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
       let active = ((try? await installer.index())?.active) ?? "?"
       lock.lock()
       bootedStorage.append(active)
-      let failure = failures[active]
+      var failure = failures[active]
+      if let remaining = remainingFailures[active] {
+        if remaining <= 0 {
+          failure = nil
+        } else {
+          remainingFailures[active] = remaining - 1
+        }
+      }
       lock.unlock()
       if let failure {
         throw RuntimeError.installFailed(step: "harness boot", detail: failure)
@@ -100,6 +112,15 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
     let runtime: FakeRuntime
     let pending: PendingUpgradeStore
     let reports: UpgradeReportStore
+    let strikes: BootStrikeLedger
+    /// The pre-upgrade probe, present only when a test wired one. `nil` is the build that has
+    /// no plugin repair at all, which is the behaviour every pre-existing test asserts.
+    var preflight: StubPreflight?
+    /// What a boot's output says, per announced URL. Empty means "this build cannot tell".
+    var health: [String: HarnessBootHealth] = [:]
+    /// Whether Safe Mode can be arranged, and what it was told.
+    var safeModeAvailable = true
+    var safeModeRequests: [String] = []
 
     init(paths: RuntimePaths, installer: HarnessInstaller, runtime: FakeRuntime) {
       self.paths = paths
@@ -107,20 +128,33 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
       self.runtime = runtime
       self.pending = PendingUpgradeStore(paths: paths)
       self.reports = UpgradeReportStore(paths: paths)
+      self.strikes = BootStrikeLedger(paths: paths)
     }
 
     func coordinator(checks: [any HarnessCheck] = []) -> HarnessUpgradeCoordinator {
       let runtime = self.runtime
+      let preflight = self.preflight
+      let health = self.health
+      let available = self.safeModeAvailable
       return HarnessUpgradeCoordinator(
         paths: paths,
         installer: installer,
         pending: pending,
         reports: reports,
+        strikes: strikes,
         profile: "web",
         stopRuntime: { await runtime.stop() },
         startRuntime: { try await runtime.start() },
         currentRuntime: { await runtime.current() },
-        makeChecks: { _ in checks }
+        makeChecks: { _ in checks },
+        preflight: preflight,
+        bootHealth: health.isEmpty ? nil : { url in health[url] ?? HarnessBootHealth(isRunning: true) },
+        escalateToSafeMode: { reason in
+          // A closure cannot mutate the bench, so the record of what it was asked lives in the
+          // preflight-independent stub the test reads back through `SafeModeRecorder`.
+          SafeModeRecorder.shared.record(reason)
+          return available
+        }
       )
     }
 
@@ -411,6 +445,205 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
     XCTAssertNil(bench.pending.record)
   }
 
+  // MARK: - The pre-upgrade plugin probe
+
+  /// The point of the whole feature: a plugin that cannot load under the release being moved
+  /// to is taken out of the picture *before* the switch, so the new release boots with it
+  /// already gone instead of silently skipping it.
+  func testPreflightQuarantinesBeforeAnyActivation() async throws {
+    let bench = try makeBench(self, active: oldID, materialized: [oldID, newID])
+    let preflight = StubPreflight(findings: ["dsh-memoir": "Cannot find package '@deepseek-ai/dsh-llm'"])
+    bench.preflight = preflight
+
+    let report = await bench.coordinator().update(toReleaseID: newID)
+
+    XCTAssertEqual(report.outcome, .kept)
+    XCTAssertEqual(preflight.calls, [["dsh-memoir"]])
+    XCTAssertEqual(report.pluginQuarantined, ["dsh-memoir"])
+    XCTAssertEqual(report.pluginPreflight?["dsh-memoir"], "Cannot find package '@deepseek-ai/dsh-llm'")
+    XCTAssertTrue(report.summary.contains("已隔离"), report.summary)
+    let activeAfter = await bench.activeReleaseID()
+    XCTAssertEqual(activeAfter, newID)
+  }
+
+  func testPreflightWithNothingToQuarantineTouchesNoProfile() async throws {
+    let bench = try makeBench(self, active: oldID, materialized: [oldID, newID])
+    let preflight = StubPreflight()
+    bench.preflight = preflight
+
+    let report = await bench.coordinator().update(toReleaseID: newID)
+
+    XCTAssertEqual(report.outcome, .kept)
+    XCTAssertTrue(preflight.calls.isEmpty)
+    XCTAssertNil(report.pluginQuarantined)
+  }
+
+  /// A plugin found but not actually disabled (it left the manifest, the write failed) must
+  /// not be reported as quarantined: the report is what the user re-enables from.
+  func testAPluginThatCouldNotBeDisabledIsNotReportedAsQuarantined() async throws {
+    let bench = try makeBench(self, active: oldID, materialized: [oldID, newID])
+    let preflight = StubPreflight(findings: ["dsh-memoir": "boom"])
+    preflight.refuses = ["dsh-memoir"]
+    bench.preflight = preflight
+
+    let report = await bench.coordinator().update(toReleaseID: newID)
+
+    XCTAssertNil(report.pluginQuarantined)
+    XCTAssertEqual(report.pluginPreflight?.count, 1)
+  }
+
+  // MARK: - The boot-failure ladder
+
+  /// A boot that fails and names a plugin: disable it, boot again, and keep the upgrade. The
+  /// user never sees the failure panel.
+  func testABootFailureThatNamesAPluginIsRepairedInPlace() async throws {
+    let bench = try makeBench(self, active: oldID, materialized: [oldID, newID])
+    let preflight = StubPreflight()
+    bench.preflight = preflight
+    let marker = "/profiles/web/node_modules/dsh-pocket/lib/index.js:3"
+    bench.runtime.failBoot(of: newID, detail: """
+      Error: failed to apply loader entry dsh-pocket (dsh-pocket): boom
+          at x (file:///x\(marker))
+      """, times: 1)
+    try TestSupport.write(
+      #"{"name":"dsh-profile-web","private":true,"dependencies":{"dsh-pocket":"1.0.0"}}"#,
+      to: bench.paths.profilesDirectory.appendingPathComponent("web/package.json")
+    )
+
+    // The quarantine is what makes it boot: the fake fails whatever release it was told to.
+    let runtime = bench.runtime
+    let report = await bench.coordinator().update(toReleaseID: newID)
+
+    XCTAssertEqual(report.outcome, .kept, report.summary)
+    XCTAssertEqual(preflight.calls, [["dsh-pocket"]])
+    XCTAssertEqual(report.pluginQuarantined, ["dsh-pocket"])
+    XCTAssertGreaterThanOrEqual(runtime.booted.count, 2, "the repair boots again")
+  }
+
+  /// A boot failure that names nobody is not a plugin story. It goes straight to the rollback
+  /// the app has always performed, without disabling anything.
+  func testABootFailureThatNamesNoPluginSkipsTheRepair() async throws {
+    let bench = try makeBench(self, active: oldID, materialized: [oldID, newID])
+    let preflight = StubPreflight()
+    bench.preflight = preflight
+    bench.runtime.failBoot(of: newID, detail: "Error: EADDRINUSE")
+
+    let report = await bench.coordinator().update(toReleaseID: newID)
+
+    XCTAssertEqual(report.outcome, .rolledBack)
+    XCTAssertTrue(preflight.calls.isEmpty)
+    let activeAfter = await bench.activeReleaseID()
+    XCTAssertEqual(activeAfter, oldID)
+  }
+
+  /// The new shape: the server comes up, and its output says a plugin is missing. Nothing in
+  /// the process state says anything is wrong, so the health factory is the only witness.
+  func testABootThatComesUpDegradedIsRepairedThenVerified() async throws {
+    let bench = try makeBench(self, active: oldID, materialized: [oldID, newID])
+    let preflight = StubPreflight()
+    bench.preflight = preflight
+    let degraded = HarnessBootHealth(
+      isRunning: true,
+      problems: [BootPluginProblem(name: "dsh-memoir", kind: .skippedBundle, isAttributed: true, line: "skipping profile bundle \"dsh-memoir\"")]
+    )
+    bench.health = [FakeRuntime.url: degraded]
+
+    let report = await bench.coordinator().update(toReleaseID: newID)
+
+    XCTAssertEqual(report.outcome, .kept, report.summary)
+    XCTAssertEqual(preflight.calls, [["dsh-memoir"]])
+    XCTAssertEqual(report.pluginQuarantined, ["dsh-memoir"])
+    XCTAssertTrue(report.notes.contains { $0.contains("启动输出报告插件问题") }, "\(report.notes)")
+  }
+
+  /// A degraded boot with no proof-backed name is reported but never repaired: disabling a
+  /// guess is how a working plugin disappears.
+  func testADegradedBootWithNoAttributableNameIsReportedOnly() async throws {
+    let bench = try makeBench(self, active: oldID, materialized: [oldID, newID])
+    let preflight = StubPreflight()
+    bench.preflight = preflight
+    bench.health = [FakeRuntime.url: HarnessBootHealth(
+      isRunning: true,
+      problems: [BootPluginProblem(name: "who-knows", kind: .importFailed, isAttributed: false, line: "1 entry did not activate")]
+    )]
+
+    let report = await bench.coordinator().update(toReleaseID: newID)
+
+    XCTAssertEqual(report.outcome, .kept)
+    XCTAssertTrue(preflight.calls.isEmpty)
+    XCTAssertNil(report.pluginQuarantined)
+    XCTAssertTrue(report.notes.contains { $0.contains("没有可证实的包名") }, "\(report.notes)")
+  }
+
+  // MARK: - The launch-time ladder
+
+  /// Second failure: the repair did not stick, so arrange Safe Mode rather than roll back
+  /// again into the same loop.
+  func testASecondFailureArrangesSafeMode() async throws {
+    let bench = try makeBench(self, active: newID, materialized: [oldID, newID])
+    try bench.makePending(from: oldID, to: newID, stage: .booting)
+    bench.runtime.setRunning(false)
+    bench.runtime.failBoot(of: newID, detail: "Error: exploded")
+    bench.strikes.recordStrike(forReleaseID: newID, stage: "booting")
+    SafeModeRecorder.shared.reset()
+
+    let report = await bench.coordinator().resumeIfNeeded()
+
+    XCTAssertEqual(report?.outcome, .aborted)
+    XCTAssertTrue(report?.notes.contains { $0.contains("安全模式") } == true, "\(report?.notes ?? [])")
+    XCTAssertTrue(SafeModeRecorder.shared.reasons.contains { $0.contains(newID) }, "\(SafeModeRecorder.shared.reasons)")
+    XCTAssertNotNil(bench.pending.record, "the marker stays: the next launch finishes the decision")
+  }
+
+  /// Third failure: stop acting. An app that keeps escalating hides which release is broken.
+  func testAThirdFailureStopsTryingAndSuggestsARollback() async throws {
+    let bench = try makeBench(self, active: newID, materialized: [oldID, newID])
+    try bench.makePending(from: oldID, to: newID, stage: .booting)
+    bench.runtime.setRunning(false)
+    bench.runtime.failBoot(of: newID, detail: "Error: exploded")
+    bench.strikes.recordStrike(forReleaseID: newID, stage: "booting")
+    bench.strikes.recordStrike(forReleaseID: newID, stage: "booting")
+    SafeModeRecorder.shared.reset()
+
+    let report = await bench.coordinator().resumeIfNeeded()
+
+    XCTAssertEqual(report?.outcome, .aborted)
+    XCTAssertTrue(report?.summary.contains("建议回退") == true, report?.summary ?? "")
+    XCTAssertTrue(SafeModeRecorder.shared.reasons.isEmpty, "nothing may be arranged a third time")
+  }
+
+  /// The first failure still rolls back, exactly as before: a rollback needs no restart, and
+  /// taking a user whose plugins merely need disabling on a Safe Mode detour is a regression.
+  func testTheFirstFailureStillRollsBack() async throws {
+    let bench = try makeBench(self, active: newID, materialized: [oldID, newID])
+    try bench.makePending(from: oldID, to: newID, stage: .booting)
+    bench.runtime.setRunning(false)
+    bench.runtime.failBoot(of: newID, detail: "Error: exploded")
+    SafeModeRecorder.shared.reset()
+
+    let report = await bench.coordinator().resumeIfNeeded()
+
+    XCTAssertEqual(report?.outcome, .rolledBack)
+    let activeAfter = await bench.activeReleaseID()
+    XCTAssertEqual(activeAfter, oldID)
+    XCTAssertNil(bench.pending.record)
+    XCTAssertTrue(SafeModeRecorder.shared.reasons.isEmpty)
+  }
+
+  /// A launch that works clears the count, so an unrelated bad launch tomorrow is not treated
+  /// as the second strike of this one.
+  func testAHealthyLaunchClearsTheStrikes() async throws {
+    let bench = try makeBench(self, active: newID, materialized: [oldID, newID])
+    try bench.makePending(from: oldID, to: newID, stage: .verifying)
+    bench.strikes.recordStrike(forReleaseID: newID, stage: "booting")
+    let passing = StubCheck(name: "rpc-endpoints", isBlocking: true, verdict: .pass, detail: "ok")
+
+    let report = await bench.coordinator(checks: [passing]).resumeIfNeeded()
+
+    XCTAssertEqual(report?.outcome, .kept)
+    XCTAssertEqual(bench.strikes.count(forReleaseID: newID), 0)
+  }
+
   // MARK: - Protecting the rollback target
 
   /// The UI disables the button; the installer has to refuse anyway, because the marker and
@@ -438,5 +671,70 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
     XCTAssertEqual(active, newID)
     let remaining = try await bench.installer.releases().map(\.id)
     XCTAssertEqual(remaining, [newID])
+  }
+}
+
+/// The one piece of mutable state the safe-mode closure can reach: a class, because the
+/// closure the bench hands the coordinator cannot capture a mutating method on the test.
+final class SafeModeRecorder: @unchecked Sendable {
+  static let shared = SafeModeRecorder()
+  private let lock = NSLock()
+  private var requests: [String] = []
+
+  func record(_ reason: String) {
+    lock.lock()
+    requests.append(reason)
+    lock.unlock()
+  }
+
+  func reset() {
+    lock.lock()
+    requests.removeAll()
+    lock.unlock()
+  }
+
+  var reasons: [String] {
+    lock.lock()
+    defer { lock.unlock() }
+    return requests
+  }
+}
+
+/// A preflight that answers from a table and records what it was asked to disable.
+final class StubPreflight: PluginPreflighting, @unchecked Sendable {
+  private let lock = NSLock()
+  private var findings: [String: String] = [:]
+  private var quarantineCalls: [[String]] = []
+  /// Names the disable will fail for, so a test can exercise "found but could not act".
+  var refuses: Set<String> = []
+
+  init(findings: [String: String] = [:]) {
+    self.findings = findings
+  }
+
+  func setFindings(_ findings: [String: String]) {
+    lock.lock()
+    self.findings = findings
+    lock.unlock()
+  }
+
+  func findUnloadable(profile: String, releaseID: String) async -> PluginLoadProbeResult {
+    lock.lock()
+    defer { lock.unlock() }
+    return PluginLoadProbeResult(unloadable: findings)
+  }
+
+  func quarantine(_ names: [String], profile: String, releaseID: String) async -> [String] {
+    lock.lock()
+    quarantineCalls.append(names)
+    let refused = refuses
+    lock.unlock()
+    return names.filter { !refused.contains($0) }
+  }
+
+  var calls: [[String]] {
+    lock.lock()
+    defer { lock.unlock() }
+    return quarantineCalls
   }
 }

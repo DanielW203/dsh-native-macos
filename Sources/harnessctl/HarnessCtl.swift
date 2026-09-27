@@ -20,6 +20,8 @@ enum HarnessCtl {
         return try await runtime(rest)
       case "plugins":
         return try await plugins(rest)
+      case "skins":
+        return try skins(rest)
       case "im":
         return try await HarnessIMCtl.run(rest)
       case "help", "-h", "--help":
@@ -58,6 +60,9 @@ enum HarnessCtl {
     harnessctl plugins import --from-home <path> --from-profile <name> --profile <name>
                             [--dry-run] [--keep-existing] [--verify]
     harnessctl plugins verify [--profile <name>] [--no-boot]
+
+    harnessctl skins list [--profile <name>]
+    harnessctl skins use <skin-id|official> [--profile <name>]
 
     harnessctl im selftest --url <url> [--dsh-home <path>] [--cwd <dir>] [--text <prompt>]
 
@@ -322,6 +327,62 @@ enum HarnessCtl {
 
     default:
       FileHandle.standardError.write(Data("unknown plugins subcommand: \(subcommand)\n".utf8))
+      return 1
+    }
+  }
+
+  // MARK: - skins
+
+  /// The skin manager, headless.
+  ///
+  /// `list` is the same discovery the window performs, which makes it the way to answer
+  /// "why is my skin not in the list" without a GUI. `use` performs the same rewrite the
+  /// window does, and reports every warning it produced rather than only the happy path.
+  private static func skins(_ arguments: [String]) throws -> Int32 {
+    guard let subcommand = arguments.first else {
+      throw RuntimeError.unsupported("skins needs a subcommand: list, use")
+    }
+    let rest = Array(arguments.dropFirst())
+
+    switch subcommand {
+    case "list":
+      let profile = value(after: "--profile", in: rest) ?? "web"
+      let manager = SkinManager(paths: try RuntimePaths.standard())
+      let found = manager.skins(profile: profile)
+      let active = manager.activeSkinID(profile: profile, in: found)
+      print("profile \(profile): \(found.count) skin(s) installed, active: \(active ?? "official")")
+      if found.isEmpty {
+        print("  no package in node_modules is a skin (skin.json, or a client bundle whose patch inserts a theme row)")
+        return 0
+      }
+      for skin in found {
+        let marker = skin.id == active ? "*" : " "
+        let kind = skin.hasSkinManifest ? "skin " : "theme"
+        let wiring = skin.isBundleWired ? "bundle-wired" : "manager-inserted"
+        print("\(marker) \(kind)  \(skin.id)  \(skin.name)  \(skin.package)  (\(wiring))")
+      }
+      return 0
+
+    case "use":
+      guard let id = rest.first, !id.hasPrefix("--") else {
+        throw RuntimeError.unsupported("skins use needs a skin id, or `official` for the stock look")
+      }
+      let profile = value(after: "--profile", in: rest) ?? "web"
+      let manager = SkinManager(paths: try RuntimePaths.standard())
+      let report = try manager.switchTo(id, profile: profile)
+      print("active: \(report.active?.id ?? "official")")
+      if !report.patchChanged {
+        print("the patch file already said exactly this; nothing was rewritten")
+      }
+      if report.marketStateUpdated {
+        print("the market's disabled list was brought into line")
+      }
+      for warning in report.warnings { print("warning \(warning)") }
+      print("reload the page for this to show")
+      return 0
+
+    default:
+      FileHandle.standardError.write(Data("unknown skins subcommand: \(subcommand)\n".utf8))
       return 1
     }
   }

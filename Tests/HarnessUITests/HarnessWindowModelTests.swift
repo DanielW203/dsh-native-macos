@@ -16,8 +16,24 @@ private final class StubLauncher: HarnessLaunching, @unchecked Sendable {
   var banner = "dsh web: http://127.0.0.1:1234/?token=SECRETTOKENVALUE"
   /// Emitted as if the launcher reported a boot step of its own.
   var stages: [String] = []
+  /// Emitted after the banner, as the harness's own boot warnings are: the lines that say a
+  /// plugin did not load arrive after "listening".
+  var extraLines: [String] = []
   /// Shared with the other stubs so a test can assert on ordering.
   var order: OrderLog?
+  /// How many more boots should fail before the scripted outcome applies.
+  private var remainingFailures = 0
+  private var failureDetail = "boom"
+
+  /// Make the next `times` boots fail, then behave as scripted. A count rather than a flag
+  /// because the repair ladder is the thing under test: the same launcher has to fail and then
+  /// succeed, without the test having to act between the two.
+  func failNextBoots(_ times: Int, detail: String = "boom") {
+    lock.lock()
+    remainingFailures = times
+    failureDetail = detail
+    lock.unlock()
+  }
   /// The profiles the launcher was asked to boot, in order.
   private(set) var profiles: [String] = []
 
@@ -60,8 +76,18 @@ private final class StubLauncher: HarnessLaunching, @unchecked Sendable {
     profiles.append(profile)
     stages.forEach(onStage)
     onLine(banner)
+    extraLines.forEach(onLine)
     while isHeld {
       try? await Task.sleep(nanoseconds: 2_000_000)
+    }
+    // A scripted failure can be spent: the repair ladder exists to be survived by the *same*
+    // stub, so "fails once then boots" has to be expressible without the test racing the call.
+    lock.lock()
+    let remaining = remainingFailures
+    if remaining > 0 { remainingFailures = remaining - 1 }
+    lock.unlock()
+    if remaining > 0 {
+      throw RuntimeError.installFailed(step: "harness web", detail: failureDetail)
     }
     return try outcome.get()
   }
@@ -609,6 +635,93 @@ final class HarnessWindowModelTests: XCTestCase {
     await model.quarantineAndRestart()
 
     XCTAssertTrue(model.log.contains { $0.contains("not available") })
+  }
+
+  /// The step that used to be a button press: a boot that fails with a plugin to blame
+  /// repairs itself once, and the user sees a running window rather than a failure panel.
+  func testAFailedBootRepairsItselfOnce() async {
+    let launcher = StubLauncher()
+    launcher.failNextBoots(1)
+    let recoverer = StubRecoverer()
+    recoverer.outcome = PluginQuarantineOutcome(disabled: ["dsh-pocket"], rounds: 1, started: true)
+    let model = HarnessWindowModel(launcher: launcher, workspacePath: "/tmp/ws", recoverer: recoverer)
+
+    await model.start()
+
+    XCTAssertEqual(recoverer.quarantineCount, 1)
+    XCTAssertEqual(model.phase, .running, "\(model.detail ?? "")")
+    XCTAssertTrue(model.log.contains { $0.contains("Trying to repair the profile automatically") })
+    XCTAssertTrue(model.log.contains { $0.contains("Turned off dsh-pocket") })
+  }
+
+  /// And exactly once per failure episode: a profile no quarantine can fix must not make the
+  /// window boot and repair in a loop.
+  func testARepairThatDoesNotFixItIsNotRetried() async {
+    let launcher = StubLauncher()
+    launcher.failNextBoots(.max)
+    let recoverer = StubRecoverer()
+    recoverer.outcome = PluginQuarantineOutcome(disabled: ["dsh-pocket"], rounds: 1, started: true)
+    let model = HarnessWindowModel(launcher: launcher, workspacePath: "/tmp/ws", recoverer: recoverer)
+
+    // One start: the attempt, the automatic repair, and the start the repair performs. The
+    // repair's own start also fails, and *that* failure must not start another repair.
+    await model.start()
+
+    XCTAssertEqual(recoverer.quarantineCount, 1)
+    XCTAssertEqual(launcher.startCount, 2)
+    XCTAssertEqual(model.phase, .failed)
+  }
+
+  /// A second episode — after a boot that worked — does get its own attempt: the allowance is
+  /// about one failure, not one window.
+  func testANewFailureAfterASuccessRepairsAgain() async {
+    let launcher = StubLauncher()
+    let recoverer = StubRecoverer()
+    recoverer.outcome = PluginQuarantineOutcome(disabled: ["dsh-pocket"], rounds: 1, started: true)
+    let model = HarnessWindowModel(launcher: launcher, workspacePath: "/tmp/ws", recoverer: recoverer)
+
+    await model.start()
+    XCTAssertEqual(model.phase, .running)
+    XCTAssertEqual(recoverer.quarantineCount, 0)
+
+    launcher.failNextBoots(1)
+    await model.start()
+
+    XCTAssertEqual(recoverer.quarantineCount, 1)
+  }
+
+  /// The failure that has no failure: the server is listening and its output says a plugin is
+  /// missing. The window has to be able to say so.
+  func testADegradedBootIsVisibleWithoutBeingAFailure() async {
+    let launcher = StubLauncher()
+    launcher.extraLines = [
+      "dsh: warning: 1 entry did not activate",
+      "web-search-free (dsh-free-search): failed to import",
+    ]
+    let model = HarnessWindowModel(launcher: launcher, workspacePath: "/tmp/ws")
+
+    await model.start()
+
+    XCTAssertEqual(model.phase, .running)
+    XCTAssertTrue(model.isDegraded)
+    XCTAssertEqual(model.bootPluginProblems, ["dsh-free-search"])
+    XCTAssertEqual(model.bootHealth.verdict, .degraded)
+  }
+
+  /// A clean boot from the same window must clear the previous boot's verdict: the lines are
+  /// re-captured per attempt, not accumulated.
+  func testACleanBootAfterADegradedOneIsClean() async {
+    let launcher = StubLauncher()
+    launcher.extraLines = ["dsh: warning: 1 entry did not activate", "x (dsh-free-search): failed to import"]
+    let model = HarnessWindowModel(launcher: launcher, workspacePath: "/tmp/ws")
+    await model.start()
+    XCTAssertTrue(model.isDegraded)
+
+    launcher.extraLines = []
+    await model.start()
+
+    XCTAssertFalse(model.isDegraded)
+    XCTAssertEqual(model.bootHealth.verdict, .healthy)
   }
 
   // MARK: - Node

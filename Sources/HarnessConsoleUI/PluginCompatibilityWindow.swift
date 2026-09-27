@@ -50,9 +50,70 @@ public struct PluginCompatibilityWindow: View {
       }
       .disabled(model.isBusy)
       .help("Re-read every plugin's declared ranges and compare them with the installed harness")
+
+      // The declared ranges above are a claim; this is the observation. A plugin whose range
+      // says the new harness is fine and whose module no longer imports is exactly the case
+      // the ranges cannot catch, and it is one Node process per plugin to find out.
+      if let releaseID = model.activeReleaseID {
+        Button {
+          Task { await model.probePluginLoads(releaseID: releaseID) }
+        } label: {
+          Label("Load-test", systemImage: "bolt.horizontal.circle")
+        }
+        .disabled(model.isBusy || model.plugins.isEmpty)
+        .help("Actually import every plugin under \(releaseID) and report the ones that fail")
+      }
     }
     .padding(.horizontal, 14)
     .padding(.vertical, 10)
+  }
+
+  /// What the last load test found, and what the app has already taken out of the picture.
+  @ViewBuilder private var probeStrip: some View {
+    if let result = model.loadProbe, let releaseID = model.loadProbeReleaseID {
+      HStack(alignment: .top, spacing: 8) {
+        Image(systemName: result.unloadable.isEmpty ? "checkmark.seal" : "exclamationmark.triangle")
+          .foregroundStyle(result.unloadable.isEmpty ? .green : .orange)
+        VStack(alignment: .leading, spacing: 2) {
+          Text("Load test under \(releaseID)")
+            .font(.caption.weight(.semibold))
+          Text(result.summary)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        Spacer(minLength: 8)
+        if !result.unloadable.isEmpty {
+          Button("隔离这些插件") {
+            Task { await model.probePluginLoads(releaseID: releaseID, quarantining: true) }
+          }
+          .disabled(model.isBusy)
+          .help("把它们从 profile 的 bundle 列表里去掉，并记录是为这个版本做的")
+        }
+      }
+      .padding(.horizontal, 14)
+      .padding(.vertical, 8)
+      .background(Color.secondary.opacity(0.06))
+    }
+
+    if !model.quarantined.isEmpty {
+      HStack(spacing: 8) {
+        Image(systemName: "shippingbox.and.arrow.backward")
+          .foregroundStyle(.orange)
+        Text("这个 profile 里有 \(model.quarantined.count) 个插件是 App 为某个版本隔离的")
+          .font(.caption)
+        Spacer()
+        ForEach(Set(model.quarantined.map(\.releaseID)).sorted(), id: \.self) { releaseID in
+          Button("恢复 \(releaseID)") {
+            Task { await model.restoreQuarantine(releaseID: releaseID) }
+          }
+          .disabled(model.isBusy)
+        }
+      }
+      .padding(.horizontal, 14)
+      .padding(.vertical, 8)
+      .background(Color.orange.opacity(0.10))
+    }
   }
 
   private var subtitle: String {
@@ -73,6 +134,7 @@ public struct PluginCompatibilityWindow: View {
   private var list: some View {
     ScrollView {
       VStack(alignment: .leading, spacing: 0) {
+        probeStrip
         summaryStrip
         ForEach(model.plugins) { plugin in
           CompatibilityRow(model: model, plugin: plugin)
@@ -188,6 +250,11 @@ private struct CompatibilityRow: View {
         Text(plugin.name).font(.callout)
         if let version = plugin.installedVersion {
           Text("v\(version)").font(.caption2.monospacedDigit()).foregroundStyle(.tertiary)
+        }
+        if let quarantine = model.quarantine(for: plugin) {
+          Text("已为该版本隔离：\(quarantine.releaseID)")
+            .font(.caption2)
+            .foregroundStyle(.orange)
         }
         Spacer()
         Text(kind.label).font(.caption).foregroundStyle(kind.colour)

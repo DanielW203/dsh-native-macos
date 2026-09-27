@@ -19,6 +19,9 @@ public enum HarnessWindowID {
   public static let pluginCompatibility = "harness.pluginCompatibility"
   public static let market = "harness.market"
   public static let console = "harness.console"
+  /// The skin manager. A window rather than a page of the Web UI because the Web UI is what
+  /// a skin changes: a skin that renders badly must not take its own way out down with it.
+  public static let skinManager = "harness.skinManager"
   public static let wechat = "harness.wechat"
   /// The native mobile gateway: pairing QR, trusted devices, and the run mode. App-level
   /// rather than a page of the harness Web UI, because the gateway serves phones while no

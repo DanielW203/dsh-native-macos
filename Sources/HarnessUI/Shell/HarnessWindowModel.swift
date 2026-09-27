@@ -49,6 +49,14 @@ public final class HarnessWindowModel: ObservableObject {
   /// first — which is what `profilePreparing` is for.
   public let profile: String
 
+  /// The runtime tree this window runs against.
+  ///
+  /// Held because the boot-health question — "which of this profile's plugins failed to
+  /// load?" — needs the profile's manifest, and the manifest lives under these paths. In Safe
+  /// Mode this is the same root with a disposable home, which is exactly what should be read:
+  /// the report has to be about the harness that is running.
+  public let paths: RuntimePaths
+
   /// Where the last chosen workspace is remembered between launches.
   public static let workspaceDefaultsKey = "NativeHarness.workspace"
 
@@ -97,9 +105,18 @@ public final class HarnessWindowModel: ObservableObject {
   /// retried by the user would re-run the resume against a marker the upgrade already
   /// resolved.
   private var didResumeUpgrade = false
+  /// Whether this failure episode has already spent its one automatic plugin repair.
+  ///
+  /// The flag is what keeps the automatic attempt from becoming the loop it is meant to
+  /// prevent: a profile that no quarantine can fix would otherwise boot and repair forever.
+  /// It resets on a boot that reaches `.running`, and never gates the manual button.
+  private var didAutoRepair = false
 
   public init(
     launcher: any HarnessLaunching,
+    paths: RuntimePaths = RuntimePaths(
+      root: FileManager.default.temporaryDirectory.appendingPathComponent("NativeHarness-model", isDirectory: true)
+    ),
     profile: String = SafeBootResolution.normalProfile,
     defaults: UserDefaults = .standard,
     workspacePath: String? = nil,
@@ -110,6 +127,7 @@ public final class HarnessWindowModel: ObservableObject {
     checkpoints: (any HealthyStartRecording)? = nil
   ) {
     self.launcher = launcher
+    self.paths = paths
     self.profile = profile
     self.defaults = defaults
     self.logFileURL = logFileURL
@@ -145,9 +163,10 @@ public final class HarnessWindowModel: ObservableObject {
     let entry: @Sendable () async throws -> URL = { try await installer.activeEntryURL() }
     let model = HarnessWindowModel(
       launcher: HarnessLauncher(paths: paths, entryProvider: entry),
+      paths: paths,
       profile: profile,
       logFileURL: logFileURL,
-      recoverer: ProfileImporter(paths: paths, entryProvider: entry),
+      recoverer: ProfileImporter(paths: paths, entryProvider: entry, releaseProvider: installer),
       nodeProvisioner: NodeProvisioner(paths: paths),
       // The shipped `web` profile is created by the harness on demand; only a rescue start
       // needs a profile built from a template before the first boot can succeed.
@@ -184,6 +203,93 @@ public final class HarnessWindowModel: ObservableObject {
   /// stopping either is what leaves the next launch to clean up. When there is genuinely
   /// nothing to stop, the stop is a no-op.
   public var mayHoldAServer: Bool { phase != .stopped }
+
+  /// Everything the harness process printed during the current boot, already redacted.
+  ///
+  /// Kept because "the server is listening" is not the same as "the server loaded your
+  /// plugins". On 0.1.7 the loader began skipping bundles it considers incompatible and
+  /// booting anyway, so the only witness to a missing plugin is the output — and once the
+  /// boot is over, the output is gone. Bounded, because a harness that boots in a loop must
+  /// not grow this without limit.
+  private var bootLines: [String] = []
+  private static let bootLineLimit = 400
+
+  /// What the last boot's output said about the plugins.
+  ///
+  /// Recomputed at the end of every boot attempt, never on each redraw: the answer needs the
+  /// profile's manifest, and a view that re-read the filesystem on every layout pass would
+  /// make "is anything degraded?" a question with a disk cost.
+  @Published public private(set) var bootHealth = HarnessBootHealth(isRunning: false)
+
+  /// The plugins this launch could not load, as package names. Empty when there are none.
+  public var bootPluginProblems: [String] { bootHealth.blamedNames }
+
+  /// Whether a running harness came up with plugins missing.
+  public var isDegraded: Bool { phase == .running && !bootHealth.bootedCleanly }
+
+  /// Recompute the boot verdict from the captured output and the profile's manifest.
+  private func refreshBootHealth() {
+    bootHealth = HarnessBootLineScanner.health(
+      isRunning: phase == .running,
+      lines: bootLines,
+      profile: profile,
+      known: declaredPluginNames()
+    )
+  }
+
+  /// The package names the profile declares, read from disk. Empty when there is no manifest.
+  func declaredPluginNames() -> Set<String> {
+    let manifestURL = paths.profilesDirectory
+      .appendingPathComponent(profile, isDirectory: true)
+      .appendingPathComponent("package.json")
+    guard let manifest = try? ProfileManifest.read(manifestURL) else { return [] }
+    return Set(ProfileManifest.dependencies(manifest).keys)
+  }
+
+  /// Plugins this app disabled to get a release to boot, for the banner and the recovery offer.
+  ///
+  /// Read on demand rather than published: the only writer is this app, and a stale copy would
+  /// offer to restore something a plugin window already restored.
+  public func quarantinedPlugins() -> [QuarantinedPlugin] {
+    let installer = HarnessInstaller(paths: paths)
+    return PluginStore(
+      paths: paths,
+      entryProvider: { try await installer.activeEntryURL() }
+    ).quarantinedPlugins(profile: profile)
+  }
+
+  /// The id of the release that is active right now, which is what a quarantine is recorded
+  /// against.
+  public var activeReleaseID: String? {
+    try? InstallsIndex.load(from: paths.installsIndex).active
+  }
+
+  /// Put back everything quarantined for the active release, then boot again.
+  ///
+  /// The counterpart of the automatic disable, and the reason it is acceptable to disable
+  /// something without asking: it is one click to restore, and the test is immediate — if the
+  /// plugin still cannot load, the boot comes up degraded and the banner names it.
+  public func restoreQuarantinedPluginsAndRetry() async {
+    guard !isBusy, let releaseID = activeReleaseID else { return }
+    isBusy = true
+    defer { isBusy = false }
+    let installer = HarnessInstaller(paths: paths)
+    let store = PluginStore(
+      paths: paths,
+      entryProvider: { try await installer.activeEntryURL() }
+    )
+    do {
+      let restored = try await store.clearQuarantine(profile: profile, releaseID: releaseID)
+      record(restored.isEmpty
+        ? "没有针对 \(releaseID) 的隔离记录，未改动。"
+        : "已恢复并重试：\(restored.joined(separator: ", "))")
+    } catch {
+      record("恢复隔离插件失败：\(String(describing: error))")
+      return
+    }
+    await startUnchecked(clearingLog: false)
+  }
+
   public var workspaceURL: URL { URL(fileURLWithPath: workspacePath, isDirectory: true) }
 
   // MARK: - Lifecycle
@@ -220,6 +326,9 @@ public final class HarnessWindowModel: ObservableObject {
     guard !isQuitting else { return }
     phase = .starting
     detail = nil
+    // A new attempt owns the boot output: the previous attempt's lines describe a process that
+    // is gone, and reading them would report plugins that this boot did load.
+    bootLines.removeAll()
     // A new attempt re-asks the question: the previous one may have ended with the user
     // installing Node from another window, and a stale "needs Node" would hide the real
     // failure behind an offer that can no longer help.
@@ -247,9 +356,11 @@ public final class HarnessWindowModel: ObservableObject {
     // Both callbacks land in the same panel: stage lines come from this app, the rest from
     // the harness process, and a boot that shows one without the other is unreadable.
     let emit: @Sendable (String) -> Void = { line in
-      Task { @MainActor in self.record(line) }
+      Task { @MainActor in
+        self.record(line)
+        self.captureBootLine(line)
+      }
     }
-
     do {
       // Before the launcher, because a profile that does not exist cannot boot and the
       // harness only creates its own shipped ones. A failure here is a real failure: the
@@ -298,6 +409,10 @@ public final class HarnessWindowModel: ObservableObject {
       if let address = state.url, let parsed = URL(string: address) {
         attachWebModel(to: parsed)
       }
+      // Reaching `.running` means the profile booted, so the auto-repair allowance resets: the
+      // next failure is a new failure and deserves its own attempt.
+      didAutoRepair = false
+      refreshBootHealth()
     } catch {
       phase = .failed
       // The launcher puts the useful part — the failing process's own output — in the
@@ -306,7 +421,19 @@ public final class HarnessWindowModel: ObservableObject {
       // And it goes in the log too: a window with a failure panel that leaves no record
       // anywhere is undiagnosable once the window is closed.
       record("start failed: \(detail ?? "unknown")")
+      refreshBootHealth()
       await probeForMissingNode()
+
+      // The step that used to be a button press. A loader that cannot apply one plugin takes
+      // the whole boot down, the Web UI that could have disabled it is exactly what never
+      // appeared, and the user's only other option was to guess. One automatic attempt, once
+      // per failure episode: a plugin that cannot be proven guilty leaves the repairer with
+      // nothing to do, and the panel below still offers the manual path.
+      if !didAutoRepair, recoverer != nil, !needsNode {
+        didAutoRepair = true
+        record("Trying to repair the profile automatically (once)…")
+        await quarantineAndRestartUnchecked()
+      }
     }
   }
 
@@ -431,6 +558,7 @@ public final class HarnessWindowModel: ObservableObject {
     url = nil
     detail = nil
     phase = .stopped
+    refreshBootHealth()
   }
 
   /// Repair a profile the harness will not boot, then start it.
@@ -447,12 +575,27 @@ public final class HarnessWindowModel: ObservableObject {
   /// click there.
   public func quarantineAndRestart(maxRounds: Int = 8) async {
     guard !isBusy else { return }
+    isBusy = true
+    defer { isBusy = false }
+    await quarantineAndRestartUnchecked(maxRounds: maxRounds)
+  }
+
+  /// The repair itself, without the busy guard.
+  ///
+  /// Split out for the same reason `startUnchecked` is: the automatic repair runs *inside* the
+  /// start that failed, and `isBusy` is already held by that start. A guarded call from there
+  /// would silently do nothing — which is exactly what the first version of this did.
+  private func quarantineAndRestartUnchecked(maxRounds: Int = 8) async {
     guard let recoverer else {
       record("Plugin repair is not available in this build.")
       return
     }
-    isBusy = true
-    defer { isBusy = false }
+
+    // The boot output of the attempt that failed has been read and reported; the boot this
+    // repair is about to perform owns the verdict from here. Without this, the lines that
+    // named the plugin would keep the window's health degraded even after it was turned off,
+    // and the banner would point at a plugin that is no longer in the picture.
+    bootLines.removeAll()
 
     // Re-read the launcher rather than trusting the window's own phase: a harness that
     // died on its own leaves this window still saying "running", and the repair has to
@@ -563,6 +706,11 @@ public final class HarnessWindowModel: ObservableObject {
   /// port and the WebView attached to it.
   public func attachUpgrader(paths: RuntimePaths, installer: HarnessInstaller) {
     let profile = self.profile
+    let probe = PluginLoadProbe(paths: paths, provider: installer)
+    let preflight = PluginPreflight(
+      probe: probe,
+      store: PluginStore(paths: paths, entryProvider: { try await installer.activeEntryURL() })
+    )
     upgrader = HarnessUpgradeCoordinator(
       paths: paths,
       installer: installer,
@@ -583,13 +731,55 @@ public final class HarnessWindowModel: ObservableObject {
           announcedURL: announcedURL,
           paths: paths,
           profile: profile,
-          activeReleaseID: active
+          activeReleaseID: active,
+          // The self-check runs in the window that listened to the boot, so the output's own
+          // verdict rides along with it and the report cannot say "plugins: pass" about a
+          // launch that printed a skipped bundle.
+          bootHealth: { [weak self] in
+            guard let self else { return nil }
+            return MainActor.assumeIsolated { self.bootHealth }
+          }
         )
       },
+      preflight: preflight,
+      bootHealth: { [weak self] announcedURL in
+        // The lines are the window's, because the window is what listens to the process; the
+        // address is passed through so the report can name the runtime it is about.
+        await MainActor.run {
+          self?.bootHealth(at: announcedURL) ?? HarnessBootHealth(isRunning: true)
+        }
+      },
+      escalateToSafeMode: Self.escalator(paths: paths),
       progress: { [weak self] line in
         Task { @MainActor in self?.record(line) }
       }
     )
+  }
+
+  /// What this launch's output says about its plugins, with the announced address on top.
+  private func bootHealth(at announcedURL: String) -> HarnessBootHealth {
+    var health = bootHealth
+    health.diagnostic = announcedURL
+    return health
+  }
+
+  /// Safe Mode for the next launch, plus the relaunch that makes it take effect.
+  ///
+  /// A static factory rather than inline code because the coordinator's safe-mode hook has to
+  /// be a plain `@Sendable` closure, and capturing the window model there would be the cycle
+  /// the static handles already avoid. The relaunch itself comes from the app through
+  /// `HarnessAppHooks`, so this stays testable with no app attached.
+  static func escalator(paths: RuntimePaths) -> HarnessUpgradeCoordinator.SafeModeEscalator {
+    { reason in
+      do {
+        try SafeBoot.enter(.rescue, base: paths)
+      } catch {
+        return false
+      }
+      HarnessAppHooks.shared.record("进入安全模式：\(reason)")
+      await HarnessAppHooks.shared.restart()
+      return true
+    }
   }
 
   /// Whether this build wired an upgrader at all.
@@ -819,6 +1009,17 @@ public final class HarnessWindowModel: ObservableObject {
     log.append(safe)
     if log.count > 200 { log.removeFirst(log.count - 200) }
     write(safe)
+  }
+
+  /// One boot line, kept for the health question rather than for display.
+  ///
+  /// Redacted for the same reason the visible log is: this buffer reaches a report and a
+  /// banner, and a launch token in either would outlive the process that used it.
+  private func captureBootLine(_ line: String) {
+    bootLines.append(Self.redacting(line))
+    if bootLines.count > Self.bootLineLimit {
+      bootLines.removeFirst(bootLines.count - Self.bootLineLimit)
+    }
   }
 
   /// Replace access-token values wherever they appear.

@@ -23,6 +23,10 @@ struct DSHNativeApp: App {
   /// while the approval centre was open would never be seen.
   @StateObject private var alerts: ApprovalAlertModel
   @StateObject private var backup: SessionBackupModel
+  /// The skin manager. App-level rather than built by its window: the window it is shown in
+  /// is one of several, and a switch must survive that window being closed and reopened —
+  /// the reload offer it holds belongs to the session, not to the view.
+  @StateObject private var skins: SkinManagerModel
   /// The native mobile gateway. App-level like the channel below: a gateway that only ran while
   /// its window was open would drop the phone mid-turn.
   @StateObject private var mobileGateway: MobileGatewayModel
@@ -52,6 +56,13 @@ struct DSHNativeApp: App {
     let boot = SafeBoot.resolve(base)
     safeBoot = boot
 
+    // The one thing the runtime layer cannot do for itself: relaunch the app. The upgrade
+    // ladder's last resort is "start without plugins", which is a Safe Mode marker plus a
+    // restart, and only this type owns the lifecycle to perform it.
+    HarnessAppHooks.shared.installRestart {
+      DSHNativeApp.mainModel?.restartApplication()
+    }
+
     // One factory so the launcher, the plugin repairer, and the Node provisioner all
     // resolve the same release and the same home: a repair run against a different runtime
     // than the one that failed would be answering another question.
@@ -64,6 +75,15 @@ struct DSHNativeApp: App {
     // session archive and the recovery window all name `base`. Only the harness process is
     // pointed at a disposable home, and repairing the throwaway one would answer nothing.
     _console = StateObject(wrappedValue: HarnessConsoleModel(paths: base))
+    // The same rule as the console: manage the real tree even in Safe Mode. A skin chosen
+    // while the harness runs against a disposable home has to still be chosen when that
+    // home is deleted, so this reads and writes `base` — never `boot.paths`.
+    let skinManager = SkinManagerModel(paths: base, profile: boot.profile)
+    // The page that has to be reloaded belongs to the main window, which does not exist yet
+    // when this closure is built — so it is reached through the static handle, exactly as
+    // the recovery window reaches the harness's start/stop.
+    skinManager.onReloadPage = { DSHNativeApp.mainModel?.reload() }
+    _skins = StateObject(wrappedValue: skinManager)
     let recoveryInstaller = HarnessInstaller(paths: base)
     let recoveryEntry: @Sendable () async throws -> URL = { try await recoveryInstaller.activeEntryURL() }
     _recovery = StateObject(wrappedValue: HarnessRecoveryModel(
@@ -242,6 +262,14 @@ struct DSHNativeApp: App {
     }
     .defaultSize(width: 760, height: 620)
 
+    // Its own window, and reachable from the Harness menu. A skin changes the page the Web
+    // UI *is*, so the control for it cannot live inside that page: the skin that renders
+    // wrong is exactly the one a user needs to switch away from.
+    Window("皮肤管理器", id: HarnessWindowID.skinManager) {
+      SkinManagerWindow(model: skins)
+    }
+    .defaultSize(width: 840, height: 640)
+
     Window("DSH Market", id: HarnessWindowID.market) {
       HarnessMarketWindow(harness: model)
     }
@@ -317,6 +345,15 @@ private struct HarnessMenu: Commands {
         openWindow(id: HarnessWindowID.pluginCompatibility)
       }
       .keyboardShortcut("p", modifiers: [.command, .option])
+
+      // Right beside the plugin windows, because that is what it is: a profile-level plugin
+      // concern this app took over from a web plugin, so that it keeps working on a page no
+      // skin has rendered correctly yet.
+      Button("皮肤管理器…") {
+        openWindow(id: HarnessWindowID.skinManager)
+      }
+      .keyboardShortcut("k", modifiers: [.command, .shift])
+      .help("安装、切换、停用 Web UI 皮肤（替代 dsh-skin-manager 插件）")
 
       // No "DSH Market…" item: the market window scene below is kept for a future entry
       // point, but the menu no longer offers it.
