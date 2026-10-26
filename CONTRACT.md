@@ -28,8 +28,9 @@ documents that are kept out of the published copy, and nothing here points at th
    this machine; see the header comment in `Tools/build.sh` for why.
 3. **Swift 5 language mode.** No `async` in initializers, no global-actor tricks.
    Prefer `struct`/`final class` + explicit locks where shared state exists.
-4. **No new package dependencies.** Foundation, SwiftUI, AppKit, JavaScriptCore,
-   Network, and the vendored `CZstd` only. No network fetching.
+4. **No new package dependencies.** Foundation, SwiftUI, AppKit, AVFoundation, Combine,
+   JavaScriptCore, Network, QuartzCore, UniformTypeIdentifiers, and the vendored `CZstd`
+   only. No network fetching.
 5. **Comment the *why*, not the *what*.** Where behaviour mirrors the official
    runtime, name the file/behaviour it mirrors. Where an observed fact drove a
    decision, state the fact in the comment — a reason a reader cannot check is not a
@@ -48,9 +49,22 @@ HarnessUI ──► HarnessKit ◄── HarnessEmbedded      (route A: embedded
 HarnessConsoleUI ──► HarnessRuntime ──► HarnessKit   (runtime/plugin console surface)
 HarnessUI ──► HarnessIM ──► HarnessKit              (app-owned WeChat channel)
 HarnessUI ──► HarnessRuntime ──► HarnessKit          (session archives; approval alerts)
+HarnessUI ──► HarnessSkills                          (the 技能中心 window; leaf module)
 CZstd ──► HarnessKit, HarnessCore                  (vendored libzstd, multi-frame)
 harnessctl ──► HarnessCore, HarnessIM               (headless CLI)
 ```
+
+`HarnessSkills` is the file-system half of what a harness loads as a skill, and the module the
+技能中心 window drives. It composes the same roots `@deepseek-ai/dsh-skill-filesystem` composes
+and with the same ranks — `<project>/.dsh/skills` 100, `<project>/.agents/skills` 200, custom
+dirs 300, `$DSH_HOME/skills` 400, `~/.agents/skills` 500 — scans one level the way the provider
+does (a directory bundle's `SKILL.md`, or a flat `<name>.md`; `.system` hidden in the user root
+only; symlinks followed and flagged), and accepts a SKILL.md only if `name`/`description` are
+present, `name` matches the official kebab-case grammar, and the two invocation booleans parse.
+The packaged (`bundled` / `runtime`) providers have no file to rewrite, so this module does not
+pretend to see them. It depends on nothing: the archive import runs `ditto` / `tar` through an
+injected `SkillCommandRunning`, which is what lets the whole rule set be asserted against a
+temporary directory.
 
 `HarnessIM` is the app-owned WeChat channel: it speaks the provider's iLink protocol, buffers
 what the user sends, and submits one batch to a **running** harness over that harness's local
@@ -122,8 +136,37 @@ because each is a thin layer over a service that already exists:
 `HarnessConsoleUI` is the console's SwiftUI surface (runtime install/update, plugin list,
 plugin install/import). It is its own module rather than a pane of `HarnessUI` because it
 needs nothing from the transcript UI. Its host is the DSHNative app, which opens it twice
-from the Harness menu — the Harness Console window and the plugin window — over one shared
+from the menu bar — the Harness Console window and the plugin window — over one shared
 `HarnessConsoleModel`.
+
+The **startup experience** (`Sources/HarnessUI/Startup/` plus
+`Apps/DSHNative/Resources/Startup/`) is app-level state, not a window's: the switch and
+preview are reachable from the menu bar while no window may be open, and the overlay is
+drawn inside the main window rather than by a second `NSWindow` — closing the last window
+quits the app, and the main window is the one that owns the server.
+
+The built-in experience is a *local* HTML/SVG/CSS surface in a disposable `WKWebView`
+(`WKWebsiteDataStore.nonPersistent()`, no network, no harness cookies; the resource
+folder is copied into the app bundle). It never delays or gates `startIfNeeded()`; the
+panel shows the real `HarnessWindowModel.log` (already token-redacted) and the only
+percentage-free progress indicator is a moving line. Handoff is owned by
+`HarnessWebModel.isReady`: `didFinish` plus a mounted `#root` (rechecked after a short
+settle), with a 15 s fail-open so a slow page is handed over to its own loading UI instead
+of a splash that never ends. The panel expands with `clip-path` and the native layer
+fades out; the real `WKWebView` underneath is never recreated or reloaded. If the
+resource, HTML or JS bridge is unavailable, the overlay closes and the existing boot
+placeholder is the fallback — never a blocked launch.
+
+`StartupExperienceModel` is once per process and on by default. The older
+`StartupAnimationModel` (a user-chosen local video copied under `<root>/startup/`) remains
+an explicit override: when enabled it takes the launch, muted and skippable. Both are
+skippable; the built-in one also respects Reduce Motion and exposes a scripted preview
+from 维护 ▸ 启动动画.
+
+The **registry install's progress** (`Sources/HarnessRuntime/NpmInstallProgress.swift`)
+is derived from `npm install --dry-run --json` plus a shallow count of `node_modules`; see
+the measured npm facts in §3. `InstallProgress.fraction` stays `nil` for every path that
+cannot be measured, and the console renders those as the spinner it always had.
 
 `HarnessKit` is written and frozen. It contains:
 
@@ -185,7 +228,18 @@ from the Harness menu — the Harness Console window and the plugin window — o
   `/var/...`** on this machine. Path arithmetic that subtracts such a URL's `path` from an
   enumerated child silently eats leading characters; use `subpathsOfDirectory(atPath:)`
   when relative names are needed (this bug shipped once in `SessionArchive` and was caught
-  by the attachment round-trip test).
+  by the attachment round-trip test). The same trap bit the startup video's copy step: a
+  file found through `contentsOfDirectory` compared unequal to the URL used to create it,
+  so the "remove everything else" pass deleted the file it was about to move. Compare by
+  name, not by URL.
+- **npm has no machine-readable download percentage** (measured 2026-10-17, npm 11.19.0):
+  its progress renderer is a TTY spinner, and `--loglevel=http` logs one line per tarball
+  but no byte counts. `npm install --dry-run --json` prints one `add <name> <version>` line
+  per package followed by the JSON document (the diff lines contain no braces, so parse
+  from the first `{`), downloads no tarball, and its `add` array is exactly the set of
+  packages this machine and platform will get. The registry install takes its progress
+  denominator from that array and counts materialized top-level `node_modules`
+  directories; do not re-derive progress from npm's log format, which is version-coupled.
 
 ---
 

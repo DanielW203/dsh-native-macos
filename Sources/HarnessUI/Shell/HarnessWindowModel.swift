@@ -735,10 +735,7 @@ public final class HarnessWindowModel: ObservableObject {
           // The self-check runs in the window that listened to the boot, so the output's own
           // verdict rides along with it and the report cannot say "plugins: pass" about a
           // launch that printed a skipped bundle.
-          bootHealth: { [weak self] in
-            guard let self else { return nil }
-            return MainActor.assumeIsolated { self.bootHealth }
-          }
+          bootHealth: Self.bootHealthProvider(self)
         )
       },
       preflight: preflight,
@@ -754,6 +751,25 @@ public final class HarnessWindowModel: ObservableObject {
         Task { @MainActor in self?.record(line) }
       }
     )
+  }
+
+  /// The boot-health provider the upgrade self-check reads.
+  ///
+  /// A static factory rather than an inline closure so the one property that matters can be
+  /// tested without a live harness or an upgrade: **this closure is read from the upgrade
+  /// coordinator's own actor**, not from the main actor, because `HarnessCheck.run()` is
+  /// `nonisolated` and the coordinator calls it from a plain `await`. The value it returns,
+  /// however, is `@Published` state of a `@MainActor` model. Reading it from that executor is
+  /// therefore a hop (`await MainActor.run`) and never an assertion — `assumeIsolated` here
+  /// traps with `dispatch_assert_queue_fail` and takes the whole app down mid-upgrade.
+  ///
+  /// The model is captured weakly: the coordinator this provider is handed to is owned by the
+  /// model, so a strong capture would be the window's own retain cycle.
+  static func bootHealthProvider(_ model: HarnessWindowModel?) -> HarnessUpgradeChecks.BootHealthProvider {
+    { [weak model] in
+      guard let model else { return nil }
+      return await MainActor.run { model.bootHealth }
+    }
   }
 
   /// What this launch's output says about its plugins, with the announced address on top.
@@ -871,6 +887,9 @@ public final class HarnessWindowModel: ObservableObject {
       record("Could not schedule the relaunch: \(error)")
       return
     }
+    // The relaunch shell is already waiting for this process to go away; a "sessions are
+    // running" alert would offer a cancel that the shell cannot honour.
+    (NSApp.delegate as? HarnessWindowDelegate)?.confirmQuitWithoutAlert()
     NSApp.terminate(nil)
   }
 
@@ -976,12 +995,16 @@ public final class HarnessWindowModel: ObservableObject {
     // client-plugin bundles first — while the toolbar confidently reports "running".
     guard webModel?.webView.url.map(Self.address(of:)) != Self.address(of: base) else { return }
     record("harness URL: \(Self.address(of: base))")
+    record("Loading the harness page…")
     let model = HarnessWebModel(
       baseURL: base,
       onExternal: { url in NSWorkspace.shared.open(url) },
       onEvent: { [weak self] event in
         Task { @MainActor in self?.record(event) }
-      }
+      },
+      // The main window is the only one that hands its page over from the launch
+      // experience, so it is the only one that needs the mounted-application probe.
+      readinessProbe: true
     )
     model.load(base)
     webModel = model
@@ -1034,7 +1057,7 @@ public final class HarnessWindowModel: ObservableObject {
   /// re-scans the whole string finds it again and rewrites the same text forever — which
   /// is a hang on the main actor, not a cosmetic bug. Here every iteration consumes at
   /// least the marker, so the remainder strictly shrinks.
-  static func redacting(_ line: String) -> String {
+  nonisolated static func redacting(_ line: String) -> String {
     var output = ""
     var rest = Substring(line)
     while let marker = rest.range(of: "token=") {
@@ -1090,6 +1113,10 @@ public final class HarnessWindowDelegate: NSObject, NSApplicationDelegate {
   /// Set by the app once the window model exists.
   public weak var model: HarnessWindowModel?
 
+  /// The main window whose red close button is guarded. Weak because the window owns its
+  /// lifetime, not this delegate.
+  private weak var guardedWindow: NSWindow?
+
   /// How long after a quit is asked for the reply happens no matter what.
   ///
   /// The stop has its own timeout; this is the backstop for everything inside it that can
@@ -1103,13 +1130,143 @@ public final class HarnessWindowDelegate: NSObject, NSApplicationDelegate {
   private var replied = false
   private var deadline: Task<Void, Never>?
 
+  /// One confirmation at a time. A second ⌘Q while the alert is up must not stack a second
+  /// alert behind it, and a close click racing that alert must be ignored.
+  private var isConfirmingQuit = false
+  /// The stop has begun; further terminate requests only wait for its reply.
+  private var isStopping = false
+  /// The user already answered "quit anyway" — either from the close button or from the
+  /// quit alert. The close path needs it because the red button closes the last window,
+  /// which makes AppKit ask `applicationShouldTerminate` a moment later; without this the
+  /// same dialog would appear twice.
+  private var terminationConfirmed = false
+
+  // MARK: - Red close button
+
+  /// Take over the main window's close button.
+  ///
+  /// The window delegate is left alone: SwiftUI owns it for window restoration and scene
+  /// lifecycle, and replacing it to answer one question would trade a confirmation dialog
+  /// for broken window behaviour. Retargeting the standard close button is enough for the
+  /// red dot, while ⌘Q and the Dock go through `applicationShouldTerminate` below.
+  public func attachCloseGuard(to window: NSWindow) {
+    guardedWindow = window
+    guard let button = window.standardWindowButton(.closeButton) else { return }
+    button.target = self
+    button.action = #selector(closeButtonPressed(_:))
+  }
+
+  /// Say that the app is quitting on purpose, so a restart/rebuild is not stopped by the
+  /// "sessions are still running" alert.
+  ///
+  /// Rebuild and language changes already tell the user the app will close and reopen; an
+  /// alert here would offer a Cancel that cannot actually cancel the hand-off script waiting
+  /// for this process to exit. Not a public UI surface: only the code paths that scheduled
+  /// such a quit call it.
+  public func confirmQuitWithoutAlert() {
+    terminationConfirmed = true
+  }
+
+  @objc private func closeButtonPressed(_ sender: NSButton) {
+    // The button's own window, not the remembered one: two main-group windows share this
+    // target, and closing the front one must close the front one.
+    guard let window = sender.window ?? guardedWindow, !isStopping, !isConfirmingQuit else { return }
+    // Closing one of several windows does not quit the app, so it interrupts nothing and
+    // must not interrupt the user with a dialog.
+    guard isLastMainWindow(window), !terminationConfirmed, let model, model.isRunning else {
+      window.performClose(nil)
+      return
+    }
+    isConfirmingQuit = true
+    Task { @MainActor in
+      let quit = await self.confirmQuitWithRunningSessions(model)
+      self.isConfirmingQuit = false
+      guard quit else { return }
+      // Set before closing: `performClose` can synchronously reach AppKit's terminate path,
+      // which must see the answer the user just gave instead of asking again.
+      self.terminationConfirmed = true
+      window.performClose(nil)
+    }
+  }
+
+  /// Whether closing this window is what quits the app.
+  private func isLastMainWindow(_ window: NSWindow) -> Bool {
+    let candidates = NSApp.windows.filter {
+      $0.isVisible && $0.canBecomeMain && !($0 is NSPanel)
+    }
+    return candidates.count <= 1 && (candidates.first === window || candidates.isEmpty)
+  }
+
+  // MARK: - Quit
+
   public func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+    guard let model, model.mayHoldAServer else { return .terminateNow }
+    // An alert or a stop is already in flight. AppKit will receive its reply from that task.
+    if isConfirmingQuit || isStopping { return .terminateLater }
+
     replied = false
     deadline?.cancel()
     deadline = nil
 
-    guard let model, model.mayHoldAServer else { return .terminateNow }
+    if terminationConfirmed {
+      beginStopping(model)
+      return .terminateLater
+    }
 
+    isConfirmingQuit = true
+    Task { @MainActor in
+      let quit = await self.confirmQuitWithRunningSessions(model)
+      self.isConfirmingQuit = false
+      guard quit else {
+        sender.reply(toApplicationShouldTerminate: false)
+        return
+      }
+      self.terminationConfirmed = true
+      self.beginStopping(model)
+    }
+    return .terminateLater
+  }
+
+  /// Ask the harness whether a turn is still running, and make the user answer for it.
+  ///
+  /// A native `NSAlert`, not a custom sheet: this is the same question every Mac app asks
+  /// before closing over unsaved work, and it is the one place where the platform's own
+  /// answer ("Quit Anyway" / "Cancel", Escape = Cancel) is the right one.
+  private func confirmQuitWithRunningSessions(_ model: HarnessWindowModel) async -> Bool {
+    guard model.isRunning, let raw = model.url, let url = URL(string: raw) else { return true }
+    guard let count = await RunningSessionProbe.liveSessionCount(authenticatedURL: url) else {
+      // The server is up but would not answer. Treating that as "nothing running" keeps the
+      // app quittable; the alternative is a dialog the user cannot act on.
+      model.recordBootNote("退出前无法查询运行中的会话，按没有会话处理。")
+      return true
+    }
+    guard count > 0 else { return true }
+
+    let preferences = AppPreferences.shared
+    let alert = NSAlert()
+    alert.alertStyle = .warning
+    alert.messageText = preferences.text(
+      count == 1 ? "还有 1 个会话没有结束" : "还有 \(count) 个会话没有结束",
+      count == 1 ? "1 session is still running" : "\(count) sessions are still running"
+    )
+    alert.informativeText = preferences.text(
+      "退出会停止 Harness，正在进行的任务会被中断。确定要退出吗？",
+      "Quitting stops the harness and interrupts the work in progress. Quit anyway?"
+    )
+    // The first button is the default (Return) and answers the question the user asked by
+    // quitting; Escape maps to Cancel, as it does in every other confirmation panel.
+    let quitButton = alert.addButton(withTitle: preferences.text("退出", "Quit Anyway"))
+    quitButton.hasDestructiveAction = true
+    alert.addButton(withTitle: preferences.text("取消", "Cancel"))
+    alert.buttons.last?.keyEquivalent = "\u{1b}"
+    NSApp.activate(ignoringOtherApps: true)
+    return alert.runModal() == .alertFirstButtonReturn
+  }
+
+  /// Start the stop and the deadline that guarantees AppKit gets an answer.
+  private func beginStopping(_ model: HarnessWindowModel) {
+    guard !isStopping else { return }
+    isStopping = true
     deadline = Task { @MainActor in
       try? await Task.sleep(nanoseconds: UInt64(Self.quitDeadline * 1_000_000_000))
       guard !Task.isCancelled else { return }
@@ -1122,7 +1279,6 @@ public final class HarnessWindowDelegate: NSObject, NSApplicationDelegate {
       await model.stopForTermination()
       self.replyOnce()
     }
-    return .terminateLater
   }
 
   /// Answer AppKit, at most once, whichever of the two paths got here first.

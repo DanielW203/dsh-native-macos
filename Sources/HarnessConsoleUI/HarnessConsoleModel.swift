@@ -143,6 +143,13 @@ public final class HarnessConsoleModel: ObservableObject {
   @Published public private(set) var log: [ConsoleLogLine] = []
   @Published public private(set) var isBusy = false
   @Published public private(set) var busyLabel: String?
+  /// A determinate install step, when the installer can measure one.
+  ///
+  /// Only the registry path reports a fraction (packages materialized so far); every other
+  /// phase leaves it `nil`, which the window renders as the indeterminate spinner it has
+  /// always shown. Kept apart from `busyLabel` because the label names the operation while
+  /// this names the step inside it.
+  @Published public private(set) var installProgress: InstallProgress?
   @Published public var importVersion: String = ""
   /// One line describing the most recent thing that happened. Always visible, on every
   /// tab: the operation log lives on its own tab, and feedback the user has to go looking
@@ -630,6 +637,7 @@ public final class HarnessConsoleModel: ObservableObject {
 
     isBusy = true
     busyLabel = "下载 \(candidate.version)"
+    installProgress = nil
     append(.info, "下载 \(candidate.version)（先不激活）…")
     let releaseID: String
     do {
@@ -649,10 +657,12 @@ public final class HarnessConsoleModel: ObservableObject {
       append(.failure, describe(error))
       isBusy = false
       busyLabel = nil
+      installProgress = nil
       return
     }
     isBusy = false
     busyLabel = nil
+    installProgress = nil
 
     await update(toReleaseID: releaseID)
   }
@@ -671,6 +681,7 @@ public final class HarnessConsoleModel: ObservableObject {
     isBusy = true
     upgradeRunning = true
     busyLabel = "更新到 \(id)"
+    installProgress = nil
     append(.info, "更新到 \(id)：激活 → 重启 → 自检…")
     let report = await runUpgrade(id)
     upgradeReport = report
@@ -1295,7 +1306,13 @@ public final class HarnessConsoleModel: ObservableObject {
   private var progressReporter: @Sendable (InstallProgress) -> Void {
     { progress in
       Task { @MainActor in
-        self.append(.progress, "\(progress.phase.displayName): \(progress.message)")
+        self.installProgress = progress
+        // Fraction ticks *are* the bar: the registry installer reports a package count a
+        // few times a second, and logging every one would bury the lines that say what
+        // actually happened. A phase boundary and a finished step still get a line.
+        if progress.fraction == nil || progress.fraction == 1 {
+          self.append(.progress, "\(progress.phase.displayName): \(progress.message)")
+        }
       }
     }
   }
@@ -1308,6 +1325,7 @@ public final class HarnessConsoleModel: ObservableObject {
     }
     isBusy = true
     busyLabel = label
+    installProgress = nil
     append(.info, label)
     do {
       try await body()
@@ -1316,6 +1334,7 @@ public final class HarnessConsoleModel: ObservableObject {
     }
     isBusy = false
     busyLabel = nil
+    installProgress = nil
   }
 
   public func append(_ kind: ConsoleLogLine.Kind, _ text: String) {

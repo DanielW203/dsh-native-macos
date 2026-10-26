@@ -120,7 +120,7 @@ const modules = [
     name: 'HarnessUI',
     kind: 'framework',
     sources: swiftSources(join(ROOT, 'Sources/HarnessUI')),
-    dependencies: ['HarnessKit', 'HarnessRuntime', 'HarnessIM', 'HarnessMobileGateway'],
+    dependencies: ['HarnessKit', 'HarnessRuntime', 'HarnessIM', 'HarnessMobileGateway', 'HarnessSkills'],
   },
   {
     // The runtime/plugin console surface. Deliberately its own module rather than a
@@ -150,6 +150,16 @@ const modules = [
     sources: swiftSources(join(ROOT, 'Sources/HarnessMobileGateway')),
     dependencies: ['HarnessKit', 'HarnessIM'],
   },
+  {
+    // The file-system half of what a harness loads as a skill: the roots the official
+    // provider composes, SKILL.md frontmatter, the two invocation switches, create /
+    // import, and the `.trash` delete. A leaf: it needs no runtime, no harness and no
+    // workspace service, which is what lets its rules be tested against a temp directory.
+    name: 'HarnessSkills',
+    kind: 'framework',
+    sources: swiftSources(join(ROOT, 'Sources/HarnessSkills')),
+    dependencies: [],
+  },
 ];
 
 const apps = [
@@ -157,7 +167,7 @@ const apps = [
     name: 'DSHNative',
     bundleID: 'ai.deepseek.nativeharness.DSHNative',
     sources: swiftSources(join(ROOT, 'Apps/DSHNative')),
-    dependencies: ['HarnessUI', 'HarnessConsoleUI', 'HarnessIM', 'HarnessRuntime', 'HarnessKit', 'CZstd'],
+    dependencies: ['HarnessUI', 'HarnessConsoleUI', 'HarnessIM', 'HarnessRuntime', 'HarnessKit', 'HarnessSkills', 'CZstd'],
     // The app icon is a real build resource rather than a file dropped into the built
     // bundle by hand: a hand-dropped file is lost on the next rebuild and the app falls
     // back to the blank default document icon. It goes through an asset catalog because
@@ -165,9 +175,21 @@ const apps = [
     // `INFOPLIST_KEY_CFBundleIconFile` build setting is silently ignored by
     // `GENERATE_INFOPLIST_FILE=YES`, so setting it produces an app whose icon file is
     // present but unnamed in the plist (measured; see CONTRACT.md §5).
-    resources: [join(ROOT, 'Apps/DSHNative/Resources/Assets.xcassets')],
+    resources: [
+      join(ROOT, 'Apps/DSHNative/Resources/Assets.xcassets'),
+      // The launch experience is a local, self-contained HTML/SVG/CSS surface. It is a
+      // folder reference (not an asset catalog) because the page loads its CSS, JS and
+      // images by relative path from the same directory.
+      join(ROOT, 'Apps/DSHNative/Resources/Startup'),
+      // A bundle with no zh-Hans localization falls back to English for the standard menus
+      // SwiftUI and AppKit build themselves (Edit, View, Window, Help, About, Quit), no matter
+      // what the app's own labels say. The folder does not have to contain much — its presence
+      // is what lets the process start with AppleLanguages = zh-Hans and draw those menus in
+      // Chinese.
+      join(ROOT, 'Apps/DSHNative/Resources/zh-Hans.lproj'),
+    ],
     iconName: 'AppIcon',
-    displayName: 'DSH Native',
+    displayName: 'Deepseek Harness Native',
     subtitle: 'Embedded engine',
   },
 ];
@@ -195,6 +217,12 @@ const testBundles = [
     name: 'HarnessMobileGatewayTests',
     sources: swiftSources(join(ROOT, 'Tests/HarnessMobileGatewayTests')),
     dependencies: ['HarnessMobileGateway'],
+    resources: [],
+  },
+  {
+    name: 'HarnessSkillsTests',
+    sources: swiftSources(join(ROOT, 'Tests/HarnessSkillsTests')),
+    dependencies: ['HarnessSkills'],
     resources: [],
   },
   {

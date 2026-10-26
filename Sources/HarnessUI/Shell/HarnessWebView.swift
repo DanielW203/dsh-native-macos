@@ -83,6 +83,17 @@ public final class HarnessWebModel: NSObject, ObservableObject {  @Published pub
   @Published public private(set) var progress: Double = 0
   @Published public private(set) var failure: String?
   @Published public private(set) var title: String?
+  /// Whether the document has finished navigating. Set by the navigation delegate, cleared
+  /// by every load. Kept separate from `isLoading` because `isLoading` is false both before
+  /// a load starts and after it ends, which is exactly the ambiguity a launch handoff must
+  /// not have.
+  @Published public private(set) var didFinishLoading = false
+  /// Whether the harness page's own application has mounted. The launch overlay waits for
+  /// this, not for the server URL: a document that loaded can still be an empty shell.
+  @Published public private(set) var isReady = false
+  /// Set when the readiness probe gave up waiting. The page is handed over anyway; the
+  /// page's own loading UI is a better place to wait than a splash that never ends.
+  @Published public private(set) var readinessWarning: String?
 
   public let webView: WKWebView
   private let baseURL: URL
@@ -97,18 +108,27 @@ public final class HarnessWebModel: NSObject, ObservableObject {  @Published pub
   /// Keeps the page's console relay alive for the lifetime of the page; the content
   /// controller also holds it, but the app owns the decision to install one.
   private let consoleRelay: WebPageConsoleRelay
+  /// Whether this page should publish "the application mounted" readiness. The main window
+  /// needs it for the launch handoff; the extra page and market windows do not, so they do
+  /// not pay for a probe that nothing reads.
+  private let readinessProbe: Bool
   private var observations: [NSKeyValueObservation] = []
+  /// Invalidates an in-flight probe when a new navigation starts. A probe from an old load
+  /// must not mark the new page ready.
+  private var readinessGeneration = 0
 
   public init(
     baseURL: URL,
     onExternal: @escaping (URL) -> Void,
     onEvent: @escaping (String) -> Void = { _ in },
-    postLoadScript: String? = nil
+    postLoadScript: String? = nil,
+    readinessProbe: Bool = false
   ) {
     self.baseURL = baseURL
     self.onExternal = onExternal
     self.onEvent = onEvent
     self.postLoadScript = postLoadScript
+    self.readinessProbe = readinessProbe
 
       let configuration = WKWebViewConfiguration()
     // Persistent on purpose: the sign-in state, the model configuration, and the chosen
@@ -227,7 +247,74 @@ public final class HarnessWebModel: NSObject, ObservableObject {  @Published pub
   public func load(_ url: URL) {
     failure = nil
     recoveredAfterSweep = false
+    resetReadiness()
     sweepThenLoad(url, schedulingFollowUps: true)
+  }
+
+  /// Cancel any probe from the page that is being replaced, and publish "not ready" until
+  /// the new document says otherwise.
+  private func resetReadiness() {
+    readinessGeneration += 1
+    didFinishLoading = false
+    isReady = false
+    readinessWarning = nil
+  }
+
+  /// The document is complete, but the harness is a React application: its root can be an
+  /// empty element for a moment after the load event. This checks for a mounted child and
+  /// asks twice, so a page is not handed over on the first paint of an empty shell.
+  static let readinessScript = """
+  (function () {
+    if (document.readyState !== 'complete') return false;
+    var root = document.getElementById('root');
+    if (root) {
+      if (root.childElementCount > 0) return true;
+      if (root.shadowRoot && root.shadowRoot.childElementCount > 0) return true;
+      return false;
+    }
+    return !!(document.body && document.body.childElementCount > 0);
+  })();
+  """
+
+  private func startReadinessProbe() {
+    guard readinessProbe else { return }
+    let generation = readinessGeneration
+    Task { @MainActor [weak self] in
+      guard let self else { return }
+      let deadline = Date().addingTimeInterval(15)
+      var stableHits = 0
+      while Date() < deadline, generation == self.readinessGeneration {
+        if await self.probePageReady() {
+          stableHits += 1
+          if stableHits >= 2 {
+            guard generation == self.readinessGeneration else { return }
+            self.isReady = true
+            self.onEvent("page ready")
+            return
+          }
+          try? await Task.sleep(nanoseconds: 250_000_000)
+        } else {
+          stableHits = 0
+          try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+      }
+      guard generation == self.readinessGeneration else { return }
+      self.isReady = true
+      self.readinessWarning = "页面在 15 秒内没有报告就绪，先交给你操作。"
+      self.onEvent("page readiness timed out; handing over anyway")
+    }
+  }
+
+  private func probePageReady() async -> Bool {
+    await withCheckedContinuation { continuation in
+      webView.evaluateJavaScript(Self.readinessScript) { value, error in
+        if error != nil {
+          continuation.resume(returning: false)
+        } else {
+          continuation.resume(returning: (value as? Bool) ?? false)
+        }
+      }
+    }
   }
 
   /// Drop every harness cookie that is not the one `url` needs, then load it.
@@ -330,6 +417,7 @@ public final class HarnessWebModel: NSObject, ObservableObject {  @Published pub
   }
 
   public func clear() {
+    resetReadiness()
     webView.load(URLRequest(url: URL(string: "about:blank")!))
   }
 }
@@ -361,6 +449,10 @@ extension HarnessWebModel: WKNavigationDelegate {
     title = webView.title
     let name = webView.title ?? "untitled"
     onEvent("page loaded: \(name)")
+    if webView.url?.scheme != "about" {
+      didFinishLoading = true
+      startReadinessProbe()
+    }
     if let postLoadScript {
       webView.evaluateJavaScript(postLoadScript) { _, error in
         if let error {
@@ -376,7 +468,8 @@ extension HarnessWebModel: WKNavigationDelegate {
     withError error: Error
   ) {
     failure = error.localizedDescription
-    onEvent("load failed: (error.localizedDescription)")
+    resetReadiness()
+    onEvent("load failed: \(error.localizedDescription)")
   }
 
   public func webView(
@@ -385,7 +478,8 @@ extension HarnessWebModel: WKNavigationDelegate {
     withError error: Error
   ) {
     failure = error.localizedDescription
-    onEvent("load failed before navigation: (error.localizedDescription)")
+    resetReadiness()
+    onEvent("load failed before navigation: \(error.localizedDescription)")
   }
 }
 

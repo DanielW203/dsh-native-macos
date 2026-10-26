@@ -153,6 +153,28 @@ final class HarnessUpgradeChecksTests: XCTestCase {
     XCTAssertEqual(result.verdict, .fail)
   }
 
+  // MARK: - Reading the window's boot-health
+
+  /// The shape that crashed the app.
+  ///
+  /// The self-check runs on the upgrade coordinator's actor, so the window's boot-health
+  /// provider is read from a background executor while the value it returns is `@MainActor`
+  /// state. `MainActor.assumeIsolated` there is an *assertion*, and a failed one is the
+  /// process: every 0.2.0-rc.2 upgrade attempt opened its window, booted, and died at the
+  /// `plugins` check with `_dispatch_assert_queue_fail`. This test dies the same way if that
+  /// shape ever comes back — the fix is the hop, and the hop is what is asserted.
+  @MainActor
+  func testBootHealthProviderCanBeReadOffTheMainActor() async {
+    let model = HarnessWindowModel(launcher: NeverStartedLauncher(), workspacePath: "/tmp/ws")
+    let provider = HarnessWindowModel.bootHealthProvider(model)
+
+    // A detached task is the executor the coordinator hands this closure to: not the main
+    // actor, and not one that can be reasoned about away.
+    let health = await Task.detached { await provider() }.value
+
+    XCTAssertNotNil(health, "provider 在非主 actor 上应当返回这次启动的健康结论")
+  }
+
   // MARK: - Report shape
 
   /// The verdicts a report is read by, including the one the asymmetry rule depends on.
@@ -163,4 +185,25 @@ final class HarnessUpgradeChecksTests: XCTestCase {
     XCTAssertEqual(HarnessCheckResult.Verdict.warn.displayName, "降级")
     XCTAssertEqual(HarnessCheckResult.Verdict.skipped.displayName, "跳过")
   }
+}
+
+/// The launcher the boot-health test needs: it is never started, so it refuses to start.
+///
+/// A real `HarnessLauncher` would need an installed release and a Node toolchain; the provider
+/// under test reads the window's health, which exists before any boot.
+private struct NeverStartedLauncher: HarnessLaunching {
+  func start(
+    profile: String,
+    host: String,
+    workingDirectory: URL?,
+    timeout: TimeInterval,
+    onLine: @escaping @Sendable (String) -> Void,
+    onStage: @escaping @Sendable (String) -> Void
+  ) async throws -> HarnessServerState {
+    throw RuntimeError.installFailed(step: "harness boot", detail: "这个测试不起 harness")
+  }
+
+  func stop(timeout: TimeInterval) async {}
+
+  func state() async -> HarnessServerState { .stopped }
 }

@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>DeepSeek Harness</title>
+  <link rel="stylesheet" href="startup.css">
+</head>
+<body class="booting">
+  <div class="backdrop" aria-hidden="true">
+    <div class="aurora aurora-a"></div>
+    <div class="aurora aurora-b"></div>
+    <div class="grid"></div>
+    <div class="bubbles">
+      <i style="--x:8%;--y:72%;--s:7px;--d:9s;--delay:-2s"></i>
+      <i style="--x:17%;--y:34%;--s:4px;--d:11s;--delay:-7s"></i>
+      <i style="--x:24%;--y:83%;--s:10px;--d:12s;--delay:-4s"></i>
+      <i style="--x:36%;--y:18%;--s:5px;--d:8s;--delay:-5s"></i>
+      <i style="--x:46%;--y:64%;--s:3px;--d:10s;--delay:-1s"></i>
+      <i style="--x:57%;--y:28%;--s:8px;--d:13s;--delay:-6s"></i>
+      <i style="--x:66%;--y:78%;--s:4px;--d:9s;--delay:-3s"></i>
+      <i style="--x:74%;--y:42%;--s:6px;--d:12s;--delay:-8s"></i>
+      <i style="--x:83%;--y:68%;--s:3px;--d:8s;--delay:-4s"></i>
+      <i style="--x:91%;--y:22%;--s:9px;--d:14s;--delay:-2s"></i>
+    </div>
+    <div class="vignette"></div>
+  </div>
+
+  <div class="handoff-glass" id="glass" aria-hidden="true"></div>
+
+  <main class="scene" id="scene">
+    <div class="brand" id="brand" aria-hidden="true">
+      <span class="press-ring"></span>
+      <img class="icon" src="assets/brand-icon.png" alt="">
+      <span class="signal signal-a"></span>
+      <span class="signal signal-b"></span>
+    </div>
+
+    <figure class="companion" id="companion" aria-hidden="true">
+      <div class="scene-card">
+        <img class="rider-scene" src="assets/rider.jpg" alt="">
+      </div>
+      <span class="companion-bubble cb1"></span>
+      <span class="companion-bubble cb2"></span>
+      <span class="companion-bubble cb3"></span>
+    </figure>
+
+    <section class="panel" id="panel" role="group" aria-label="DeepSeek Harness 启动状态" data-status="initializing">
+      <header class="panel-head">
+        <span class="live-dot" id="liveDot"></span>
+        <div class="titles">
+          <h1>DeepSeek Harness</h1>
+          <p>Native · 启动诊断</p>
+        </div>
+        <span class="safe-chip" id="safeChip" hidden>安全模式</span>
+        <span class="status-pill" id="status">INITIALIZING</span>
+      </header>
+      <div class="panel-rule"></div>
+      <div class="log-wrap">
+        <ol class="log" id="log" aria-live="off"></ol>
+      </div>
+      <div class="error" id="error" hidden>
+        <p class="error-title" id="errorTitle">启动没有完成</p>
+        <pre class="error-detail" id="detail"></pre>
+        <div class="actions" id="actions"></div>
+      </div>
+      <footer class="panel-foot">
+        <div class="foot-line">
+          <span class="hint" id="hint">正在准备启动…</span>
+          <span class="elapsed" id="elapsed">0s</span>
+        </div>
+        <div class="progress" id="progress" data-state="running"><i></i></div>
+      </footer>
+    </section>
+
+    <div class="tagline" id="tagline">From Icon <span>→</span> To Your Workspace</div>
+    <button class="skip" id="skip" type="button" aria-label="跳过启动动画">跳过动画 <kbd>Esc</kbd></button>
+
+    <div class="preview-bar" id="previewBar" hidden>
+      <span class="preview-label">预览模式 · 示例日志</span>
+      <button type="button" id="replay">重播</button>
+      <button type="button" id="failDemo">失败态</button>
+      <button type="button" id="slowToggle">0.25×</button>
+    </div>
+  </main>
+
+  <script src="startup.js"></script>
+</body>
+</html>

@@ -11,40 +11,90 @@ public struct HarnessWebWindow: View {
   @ObservedObject var model: HarnessWindowModel
   /// What to say about the mode this launch was started in, or `nil` for a normal start.
   let banner: SafeModeBanner?
-  /// The WeChat channel, when this window was opened by the app that owns one. Absent in a
-  /// preview or a test host, where the switch would have nothing to switch.
-  let channel: WeChatChannelModel?
+  /// The startup video. App-level state, handed in by the app because the same switch is
+  /// edited from the menu bar, not from this window.
+  @ObservedObject private var startup: StartupAnimationModel
+  /// The built-in launch experience. App-level for the same reason the video is: the launch
+  /// decision is once per process, and the same switch is edited from the menu bar.
+  @ObservedObject private var startupExperience: StartupExperienceModel
+  /// Appearance and language, read by the status line. Handed in rather than reached through
+  /// `AppPreferences.shared` so a preview can render the other language without mutating the
+  /// app's saved choice.
+  @ObservedObject private var preferences: AppPreferences
   @Environment(\.openWindow) private var openWindow
-  /// The rebuild-and-restart sheet. Owned by this window because the button that opens it is
-  /// here, and because the hand-off needs *this* process to be the one that quits.
-  @StateObject private var rebuild = RebuildModel()
+  /// The rebuild-and-restart sheet. The command that opens it lives in the menu bar now, so
+  /// the model is owned by the app and only presented by this window: the hand-off still
+  /// needs *this* process to be the one that quits.
+  @ObservedObject private var rebuild: RebuildModel
 
-  public init(model: HarnessWindowModel, banner: SafeModeBanner? = nil, channel: WeChatChannelModel? = nil) {
+  public init(
+    model: HarnessWindowModel,
+    banner: SafeModeBanner? = nil,
+    startup: StartupAnimationModel,
+    startupExperience: StartupExperienceModel,
+    preferences: AppPreferences,
+    rebuild: RebuildModel
+  ) {
     self.model = model
     self.banner = banner
-    self.channel = channel
+    _startup = ObservedObject(wrappedValue: startup)
+    _startupExperience = ObservedObject(wrappedValue: startupExperience)
+    _preferences = ObservedObject(wrappedValue: preferences)
+    _rebuild = ObservedObject(wrappedValue: rebuild)
   }
 
   public var body: some View {
-    VStack(spacing: 0) {
-      if model.isDegraded {
-        degradedBanner
+    ZStack {
+      VStack(spacing: 0) {
+        if let banner {
+          safeModeBanner(banner)
+          Divider()
+        }
+        toolbar
         Divider()
+        if let web = model.webModel, model.isRunning {
+          HarnessWebContent(model: web)
+        } else {
+          placeholder
+        }
       }
-      if let banner {
-        safeModeBanner(banner)
-        Divider()
-      }
-      toolbar
-      Divider()
-      if let web = model.webModel, model.isRunning {
-        HarnessWebContent(model: web)
-      } else {
-        placeholder
+      // The launch surface replaces the page for VoiceOver while it covers it; two live
+      // accessibility trees over one window would be read as two applications.
+      .accessibilityHidden(startup.isPresenting || startupExperience.isPresenting)
+
+      // The startup animation covers the content rather than living in its own window: the
+      // window owns the server, the app quits with its last window, and the video is only
+      // ever a few seconds. The harness keeps booting underneath it.
+      if startup.isPresenting, let video = startup.videoURL {
+        StartupAnimationView(url: video) { startup.dismiss() }
+          // Appears in the window's first frame (the switch is thrown on appear), so only
+          // the exit is animated; fading in would show one pass of the boot screen first.
+          .transition(.asymmetric(insertion: .identity, removal: .opacity))
+      } else if startupExperience.isPresenting {
+        StartupOverlayView(
+          boot: model,
+          experience: startupExperience,
+          mode: startupExperience.isPreview ? .preview : .live,
+          safeMode: banner != nil,
+          onOpenRecovery: {
+            openWindow(id: HarnessWindowID.recovery)
+          }
+        )
+        // Insert immediately: the overlay's own backdrop covers the placeholder from the
+        // first frame. Only the removal fades, and by then the web view is already at
+        // alpha 0, so the real page is what is left underneath.
+        .transition(.asymmetric(insertion: .identity, removal: .opacity))
       }
     }
+    .animation(.easeOut(duration: 0.45), value: startup.isPresenting)
+    .animation(.easeOut(duration: 0.2), value: startupExperience.isPresenting)
     .frame(minWidth: 920, minHeight: 640)
     .task { await model.startIfNeeded() }
+    .onAppear {
+      startup.presentAtLaunch()
+      // The video is an explicit override; the built-in experience fills the default.
+      startupExperience.presentAtLaunch(customVideoPlaying: startup.isPresenting)
+    }
     .sheet(isPresented: $rebuild.isPresented) {
       RebuildSheet(model: rebuild)
     }
@@ -54,47 +104,6 @@ public struct HarnessWebWindow: View {
   }
 
   // MARK: - A harness that is up but incomplete
-
-  /// Says what the boot output said and nothing in the window would otherwise show.
-  ///
-  /// This is the banner for the failure that has no failure: the server is listening, the page
-  /// works, and two of the user's plugins are missing because the loader skipped them. Before
-  /// this, the only place that fact existed was a line in a log nobody reads.
-  private var degradedBanner: some View {
-    let problems = model.bootPluginProblems
-    let quarantined = model.quarantinedPlugins()
-    return HStack(alignment: .top, spacing: 10) {
-      Image(systemName: "puzzlepiece.extension")
-        .foregroundStyle(.yellow)
-      VStack(alignment: .leading, spacing: 2) {
-        Text("这个版本下没有加载上的插件（\(problems.count)）")
-          .font(.callout.weight(.medium))
-        Text(problems.joined(separator: ", "))
-          .font(.caption)
-          .foregroundStyle(.secondary)
-          .fixedSize(horizontal: false, vertical: true)
-        if !quarantined.isEmpty {
-          Text("已隔离：\(quarantined.map(\.name).joined(separator: ", "))")
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-        }
-      }
-      Spacer(minLength: 12)
-      if !quarantined.isEmpty {
-        Button("恢复并重试") {
-          Task { await model.restoreQuarantinedPluginsAndRetry() }
-        }
-        .disabled(model.isBusy)
-        .help("把为这个版本隔离的插件放回 profile 并重新启动 harness")
-      }
-      Button("打开插件…") {
-        openWindow(id: HarnessWindowID.plugins)
-      }
-    }
-    .padding(.horizontal, 14)
-    .padding(.vertical, 10)
-    .background(Color.yellow.opacity(0.12))
-  }
 
   // MARK: - Safe Mode
 
@@ -146,62 +155,9 @@ public struct HarnessWebWindow: View {
           .help("The local address of the running harness. The access token the page needs is not shown.")
       }
 
-      Spacer()
-
-      // First on the right because it is the only control here that can be *waiting* on the
-      // user: a question parked on the phone blocks a running turn until it is answered.
-      if let channel {
-        PhoneRemoteControlButton(channel: channel)
-      }
-
-      // Left of Reload because it is the heavier version of it: a reload re-fetches the
-      // page, while this is the only thing that applies a workspace change, picks up a
-      // runtime that was just installed, or frees a port a stuck harness is holding.
-      Button {
-        model.restartApplication()
-      } label: {
-        Label("Restart", systemImage: "arrow.triangle.2.circlepath")
-      }
-      .help("Quit and reopen this app, so the harness starts fresh")
-
-      // Right of Restart because it *is* Restart, one level up: it recompiles the checkout
-      // before bringing the app back, so the window that returns is the code that was just
-      // built rather than the code that was already running. It is the only control here
-      // that needs to know where the sources are, which is why it can also be the one that
-      // asks.
-      Button {
-        rebuild.present()
-      } label: {
-        Label("Rebuild", systemImage: "hammer")
-      }
-      .help("Rebuild DSHNative from its source checkout, then quit and reopen the installed app")
-
-      if model.isRunning {
-        Button {
-          model.reload()
-        } label: {
-          Label("Reload", systemImage: "arrow.clockwise")
-        }
-        Button {
-          model.openInBrowser()
-        } label: {
-          Label("Open in Browser", systemImage: "safari")
-        }
-        .help("Open the same session in your default browser")
-        Button {
-          Task { await model.stop() }
-        } label: {
-          Label("Stop", systemImage: "stop.circle")
-        }
-        .disabled(model.isBusy)
-      } else {
-        Button {
-          Task { await model.start() }
-        } label: {
-          Label("Start", systemImage: "play.circle")
-        }
-        .disabled(model.isBusy)
-      }
+      // Every control that used to sit here — phone remote, restart, rebuild, reload, open
+      // in a browser, start/stop — is a menu bar item now. The window keeps only what the
+      // page cannot say for itself: whether the server is up, and where.
     }
     .padding(.horizontal, 14)
     .padding(.vertical, 9)
@@ -209,10 +165,10 @@ public struct HarnessWebWindow: View {
 
   private var phaseLabel: String {
     switch model.phase {
-    case .stopped: return "Harness stopped"
-    case .starting: return "Starting the harness…"
-    case .running: return "Harness running"
-    case .failed: return "The harness failed to start"
+    case .stopped: return preferences.text("Harness 已停止", "Harness stopped")
+    case .starting: return preferences.text("正在启动 Harness…", "Starting the harness…")
+    case .running: return preferences.text("Harness 运行中", "Harness running")
+    case .failed: return preferences.text("Harness 启动失败", "The harness failed to start")
     }
   }
 

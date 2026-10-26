@@ -15,14 +15,38 @@ import SwiftUI
 /// and status line.
 public struct HarnessPluginWindow: View {
   @ObservedObject var model: HarnessConsoleModel
+  /// Plugins this launch could not load, and the ones the app quarantined trying. The main
+  /// window used to own a yellow banner for this; it lives here now, beside the list whose
+  /// subject it is, so the main window can be nothing but the page.
+  private let bootProblems: [String]
+  private let quarantined: [String]
+  private let bootTitle: String
+  private let restoreTitle: String
+  private let onRestore: (() -> Void)?
 
-  public init(model: HarnessConsoleModel) {
+  public init(
+    model: HarnessConsoleModel,
+    bootProblems: [String] = [],
+    quarantined: [String] = [],
+    bootTitle: String = "Some plugins did not load",
+    restoreTitle: String = "Restore and Retry",
+    onRestore: (() -> Void)? = nil
+  ) {
     self.model = model
+    self.bootProblems = bootProblems
+    self.quarantined = quarantined
+    self.bootTitle = bootTitle
+    self.restoreTitle = restoreTitle
+    self.onRestore = onRestore
   }
 
   public var body: some View {
     VStack(spacing: 0) {
       header
+      if !bootProblems.isEmpty {
+        Divider()
+        bootNotice
+      }
       Divider()
       PluginsPane(model: model)
       Divider()
@@ -33,6 +57,39 @@ public struct HarnessPluginWindow: View {
     // `startIfNeeded` is what makes that safe when both windows are open at once: the model
     // is started once, by whichever window got there first.
     .task { await model.startIfNeeded() }
+  }
+
+  /// What the last boot said about the plugins, shown above the list it affects.
+  ///
+  /// The same facts the main window's banner carried, but next to the plugin list: a name
+  /// here can be compared with the installed list in one glance, which a strip across the
+  /// page never allowed.
+  private var bootNotice: some View {
+    HStack(alignment: .top, spacing: 10) {
+      Image(systemName: "puzzlepiece.extension")
+        .foregroundStyle(.orange)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(bootTitle)
+          .font(.callout.weight(.medium))
+        Text(bootProblems.joined(separator: ", "))
+          .font(.caption)
+          .foregroundStyle(.secondary)
+          .fixedSize(horizontal: false, vertical: true)
+        if !quarantined.isEmpty {
+          Text(quarantined.joined(separator: ", "))
+            .font(.caption2)
+            .foregroundStyle(.tertiary)
+        }
+      }
+      Spacer(minLength: 12)
+      if !quarantined.isEmpty, let onRestore {
+        Button(restoreTitle, action: onRestore)
+          .disabled(model.isBusy)
+      }
+    }
+    .padding(.horizontal, 14)
+    .padding(.vertical, 9)
+    .background(Color.orange.opacity(0.10))
   }
 
   /// The window's chrome. The profile picker and the operations live in `PluginsPane`, next

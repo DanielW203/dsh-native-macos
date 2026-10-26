@@ -21,8 +21,9 @@ versions, provisioning Node and managing plugins are all the app's job — open 
 ## Highlights
 
 - **Native window**: the harness Web UI runs in an app window, not a browser; if Node is missing the app installs a private copy and leaves your system alone
-- **Version management**: works across official versions, self-checks every upgrade, and can roll back to an older release whenever you need to fix something (next section)
+- **Version management**: works across official versions, self-checks every upgrade, and can roll back to an older release whenever you need to fix something (next section); while a new version downloads from npm, the console shows a progress bar driven by the packages already on disk
 - **Multiple windows**: several views of the same harness, opened repeatedly with ⌥⌘N; only the main window can start or stop the server
+- **Three menu-bar menus**: Harness (window, reload, approvals / WeChat / mobile) · 工具 (plugins, compatibility, skins, skills, backup, export) · 维护 (console, recovery, safe modes, startup animation)
 - **WeChat IM + phone remote control**: `/list`, `/use`, `/history`, `/say`, `/stop`, `/answer`, `/workspace`,
   `/model`, `/effort`; switching remote control on first sends a connectivity self-check to WeChat, after
   which approvals and questions go there, a running desktop turn streams its own text paragraphs in
@@ -31,6 +32,13 @@ versions, provisioning Node and managing plugins are all the app's job — open 
 - **Skin manager**: a native window that lists the installed skins, switches between them in one click, and goes
   back to the stock look; it rewrites the harness's own `cordis.patch.yml` and takes effect through hot reload,
   replacing web plugins such as `dsh-skin-manager`
+- **Skill centre**: 工具 ▸ 技能中心 (⇧⌘S) lists the file-system skills by root, switches model
+  invocation and manual `/skill` invocation separately (by rewriting `disable-model-invocation` /
+  `user-invocable` in SKILL.md, which the harness hot-reloads), creates a skill from a form, imports one
+  from a directory / `.md` / `.zip` / `.tar.gz`, and deletes into the root's `.trash` with restore and
+  purge; skills shadowed by a higher-priority root and skills the registry would refuse are listed with
+  the reason
+- **Startup experience**: a local SVG/HTML brand animation — the icon presses, an orange swift flies out, the whale-rider settles left, and a live boot panel shows the real log before expanding into the preloaded Harness page. It never blocks boot, is skippable and respects Reduce Motion; 维护 ▸ 启动动画 toggles, previews or skips it. An optional local video can explicitly override it (muted, plays once, skippable, copied into the app's own directory)
 - **Safe start and recovery**: two levels of escape — drop the plugins first, then the whole home — plus a recovery window that can roll configuration back
 - **Local only**: everything lives under your own home directory; no telemetry, no account
 
@@ -178,7 +186,7 @@ takes the whole boot down — and the interface you would use to disable it (the
 
 The fix took two steps:
 
-1. **Harness → Plugin…** (⇧⌘P) in the menu bar opens the plugin list; turn the offending plugin **off**. That path
+1. **工具 → Plugin…** (⇧⌘P) in the menu bar opens the plugin list; turn the offending plugin **off**. That path
    goes through the app's own disabled ledger and `cordis.patch.yml`, so it does not need the harness to be running.
 2. **Quit the app fully and reopen it** — the harness comes up normally and the other plugins still load.
 
@@ -264,7 +272,7 @@ plugin-related menu items are disabled.
 
 ## Skin manager
 
-**Harness ▸ 皮肤管理器…** (⇧⌘K) lists every skin installed in the selected profile and switches between
+**工具 ▸ 皮肤管理器…** (⇧⌘K) lists every skin installed in the selected profile and switches between
 them in one click; **官方默认** returns to DeepSeek Harness' own appearance.
 
 **Why a native window instead of the web plugin.** A skin is what the Web UI *is*: with a skin that renders

@@ -55,7 +55,13 @@ public final class RebuildModel: ObservableObject {
     handoff: @escaping @Sendable (SelfRebuild, Int32) throws -> Void = { service, pid in
       try service.scheduleHandoff(waitingFor: pid)
     },
-    terminate: @escaping @MainActor () -> Void = { NSApp.terminate(nil) }
+    terminate: @escaping @MainActor () -> Void = {
+      // The rebuild hand-off is already scheduled and is waiting for this process to exit.
+      // Asking "sessions are still running?" here would offer a Cancel that the waiting
+      // shell does not implement.
+      (NSApp.delegate as? HarnessWindowDelegate)?.confirmQuitWithoutAlert()
+      NSApp.terminate(nil)
+    }
   ) {
     self.locate = locate
     self.makeService = makeService

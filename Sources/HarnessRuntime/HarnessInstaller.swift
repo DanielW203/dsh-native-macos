@@ -475,22 +475,63 @@ public actor HarnessInstaller {
     ])
     try Data(try manifest.serialized().utf8).write(to: staging.appendingPathComponent("package.json"))
 
-    progress(InstallProgress(phase: .installingDependencies, message: "npm install \(spec)"))
+    let environment = npmEnvironment(for: toolchain)
     try FileManager.default.createDirectory(at: paths.npmCacheDirectory, withIntermediateDirectories: true)
-    let result = try await runStreaming(
-      ProcessRequest(
-        executable: npm.program,
-        arguments: npm.prefix + ["install", "--no-audit", "--no-fund", "--loglevel=error", spec],
-        environment: npmEnvironment(for: toolchain),
-        currentDirectory: staging,
-        timeout: 3600,
-        label: "npm install \(spec)"
-      ),
-      phase: .installingDependencies,
-      progress: progress
-    )
+
+    // Resolve the tree before installing it. The dry run performs the same resolution the
+    // install will, but downloads no tarball; its `add` list is the only exact denominator
+    // available, because npm itself only renders a TTY spinner. A failure here is not
+    // fatal: the install proceeds and the console keeps its indeterminate spinner.
+    progress(InstallProgress(phase: .installingDependencies, message: "Resolving the dependency tree"))
+    let plan = await registryPlan(npm: npm, spec: spec, staging: staging, environment: environment)
+
+    progress(InstallProgress(phase: .installingDependencies, message: "npm install \(spec)"))
+    if let plan {
+      progress(InstallProgress(
+        phase: .installingDependencies,
+        message: "\(plan.totalCount) packages to install",
+        fraction: 0
+      ))
+    }
+    let monitor = plan.flatMap { plan in
+      startPackageMonitor(
+        plan,
+        nodeModules: staging.appendingPathComponent("node_modules", isDirectory: true),
+        progress: progress
+      )
+    }
+
+    let result: ProcessResult
+    do {
+      result = try await runStreaming(
+        ProcessRequest(
+          executable: npm.program,
+          arguments: npm.prefix + ["install", "--no-audit", "--no-fund", "--loglevel=error", spec],
+          environment: environment,
+          currentDirectory: staging,
+          timeout: 3600,
+          label: "npm install \(spec)"
+        ),
+        phase: .installingDependencies,
+        progress: progress
+      )
+    } catch {
+      monitor?.cancel()
+      await monitor?.value
+      throw error
+    }
+    monitor?.cancel()
+    await monitor?.value
+
     guard result.succeeded else {
       throw RuntimeError.installFailed(step: "npm install \(spec)", detail: result.diagnostics(maxLines: 120))
+    }
+    if let plan {
+      progress(InstallProgress(
+        phase: .installingDependencies,
+        message: "Downloaded \(plan.totalCount) / \(plan.totalCount) packages",
+        fraction: 1
+      ))
     }
     // The registry publishes an integrity value, but npm has already enforced it during
     // the fetch; re-deriving it here would mean hashing hundreds of megabytes of a tree
@@ -526,6 +567,62 @@ public actor HarnessInstaller {
       let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
       guard !trimmed.isEmpty else { return }
       progress(InstallProgress(phase: phase, message: trimmed))
+    }
+  }
+
+  /// Ask npm to resolve the dependency tree without fetching any tarball.
+  ///
+  /// Returns `nil` for every failure mode on purpose: a registry that does not answer the
+  /// dry run, an npm old enough to ignore `--json`, an output shape this parser does not
+  /// recognise — none of them should block an install that would otherwise work. The
+  /// caller then reports progress the way it always did (an indeterminate spinner).
+  private func registryPlan(
+    npm: ToolchainExecutable,
+    spec: String,
+    staging: URL,
+    environment: [String: String]
+  ) async -> NpmInstallPlan? {
+    let request = ProcessRequest(
+      executable: npm.program,
+      arguments: npm.prefix + [
+        "install", "--dry-run", "--json", "--no-audit", "--no-fund", "--loglevel=error", spec,
+      ],
+      environment: environment,
+      currentDirectory: staging,
+      timeout: 600,
+      label: "npm install --dry-run \(spec)"
+    )
+    guard let result = try? await runner.run(request), result.succeeded else { return nil }
+    return NpmInstallPlan.parse(result.stdout)
+  }
+
+  /// Report how many packages npm has materialized, a few times a second.
+  ///
+  /// Runs on the installer's own executor: it only lists one or two directory levels and
+  /// calls the progress sink, both cheap enough that a separate queue (and the locking it
+  /// would need) is not worth it. `nil` when the plan has no top-level packages, because a
+  /// fraction would have no denominator.
+  private func startPackageMonitor(
+    _ plan: NpmInstallPlan,
+    nodeModules: URL,
+    progress: @escaping @Sendable (InstallProgress) -> Void
+  ) -> Task<Void, Never>? {
+    let total = plan.topLevelCount
+    guard total > 0 else { return nil }
+    return Task { [progress] in
+      var reported = -1
+      while !Task.isCancelled {
+        let count = min(NpmPackageCounter.materialized(inNodeModules: nodeModules), total)
+        if count != reported {
+          reported = count
+          progress(InstallProgress(
+            phase: .installingDependencies,
+            message: "Downloading dependencies: \(count) / \(total) packages",
+            fraction: min(0.99, Double(count) / Double(total))
+          ))
+        }
+        try? await Task.sleep(nanoseconds: 400_000_000)
+      }
     }
   }
 

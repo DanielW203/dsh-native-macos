@@ -64,9 +64,23 @@ final class HarnessProcessSweepTests: XCTestCase {
       arguments: [decoy.path, "--profile", "web", "--port", "6002"]
     )
 
-    let found = HarnessProcessSweep.servers(under: paths.releasesDirectory)
+    // The kernel's all-pids snapshot can lag a process that was just spawned — even after
+    // its own argv is readable — and the parallel test runner makes that window visible.
+    // A short retry keeps the test about the sweep's matching rules rather than about that
+    // publication delay; a genuine matching bug still fails after the deadline.
+    var found: [(pid: pid_t, argv: [String])] = []
+    var attempts = 0
+    repeat {
+      found = HarnessProcessSweep.servers(under: paths.releasesDirectory)
+      if found.map(\.pid) == [inServer.pid] { break }
+      attempts += 1
+      if attempts < 40 { usleep(50_000) }
+    } while attempts < 40
+
     XCTAssertEqual(found.map(\.pid), [inServer.pid])
-    XCTAssertEqual(HarnessServerRecord.port(inArguments: found[0].argv), 6001)
+    // Guarded rather than indexed: when the sweep misses a server this test should report
+    // that failure, not crash the whole test process on an empty array.
+    XCTAssertEqual(HarnessServerRecord.port(inArguments: try XCTUnwrap(found.first).argv), 6001)
   }
 
   func testExcludedPidsAreNeverReturned() async throws {
@@ -217,16 +231,21 @@ final class HarnessProcessSweepTests: XCTestCase {
     // otherwise leave its fake server alive, and the suite would leak one process per
     // failure, observed for real while writing these tests.
     spawned.append(process)
-    // Give the kernel a moment to publish the new process before it is inspected.
+    // Wait for the argument vector, not just the pid. posix_spawn returns before the child
+    // is guaranteed to have completed exec, and the sweep matches on argv; under the
+    // parallel test runner that gap is wide enough for the sweep to miss a process this
+    // test just started (the failure surfaced as an index crash on an empty result).
+    let expected = arguments.first
     var waited = 0
-    while !processIsAlive(process.pid), waited < 40 {
+    while waited < 80 {
+      if let argv = HarnessProcessSweep.arguments(of: process.pid),
+         let expected,
+         argv.contains(expected) {
+        break
+      }
       usleep(25_000)
       waited += 1
     }
     return process
-  }
-
-  private func processIsAlive(_ pid: Int32) -> Bool {
-    kill(pid, 0) == 0 || errno == EPERM
   }
 }

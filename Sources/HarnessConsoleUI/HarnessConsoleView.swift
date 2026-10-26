@@ -89,21 +89,31 @@ struct ConsoleStatusStrip: View {
   @ObservedObject var model: HarnessConsoleModel
 
   var body: some View {
-    HStack(spacing: 8) {
-      if model.isBusy {
-        ProgressView().controlSize(.small)
-      } else {
-        Image(systemName: model.statusKind == .failure ? "exclamationmark.triangle.fill" : "info.circle")
-          .foregroundStyle(consoleColour(for: model.statusKind))
+    VStack(spacing: 4) {
+      // The bar sits above the line rather than replacing the spinner: a run can move from
+      // a measured step (packages) to an unmeasured one (restart + checks) and back, and
+      // the strip has to be honest in both states.
+      if model.isBusy, let fraction = model.installProgress?.fraction {
+        ProgressView(value: fraction)
+          .progressViewStyle(.linear)
+          .controlSize(.small)
       }
-      Text(model.statusLine)
-        .font(.caption)
-        .foregroundStyle(model.statusKind == .failure ? Color.red : Color.primary)
-        .lineLimit(2)
-        .textSelection(.enabled)
-      Spacer()
-      if model.isBusy, let label = model.busyLabel {
-        Text(label).font(.caption2).foregroundStyle(.secondary)
+      HStack(spacing: 8) {
+        if model.isBusy {
+          ProgressView().controlSize(.small)
+        } else {
+          Image(systemName: model.statusKind == .failure ? "exclamationmark.triangle.fill" : "info.circle")
+            .foregroundStyle(consoleColour(for: model.statusKind))
+        }
+        Text(model.statusLine)
+          .font(.caption)
+          .foregroundStyle(model.statusKind == .failure ? Color.red : Color.primary)
+          .lineLimit(2)
+          .textSelection(.enabled)
+        Spacer()
+        if model.isBusy, let label = model.busyLabel {
+          Text(label).font(.caption2).foregroundStyle(.secondary)
+        }
       }
     }
     .padding(.horizontal, 14)
@@ -140,6 +150,7 @@ private struct RuntimePane: View {
         activeCard
         actionsCard
         candidatesCard
+        installProgressCard
         upgradeCard
         releasesCard
       }
@@ -436,6 +447,35 @@ private struct RuntimePane: View {
     }
   }
 
+  /// A measured step of a long install, when the installer can measure one.
+  ///
+  /// Only the registry path reports a fraction (packages materialized so far). Every other
+  /// phase leaves it nil, and this card stays out of the way rather than showing an empty
+  /// bar next to the "正在更新" spinner that already describes those phases.
+  @ViewBuilder
+  private var installProgressCard: some View {
+    if model.isBusy, let progress = model.installProgress, let fraction = progress.fraction {
+      GroupBox("正在下载运行时") {
+        VStack(alignment: .leading, spacing: 6) {
+          ProgressView(value: fraction)
+            .progressViewStyle(.linear)
+          HStack(spacing: 8) {
+            Text(progress.message)
+              .font(.caption)
+              .foregroundStyle(.secondary)
+              .textSelection(.enabled)
+            Spacer()
+            Text("\(Int((fraction * 100).rounded()))%")
+              .font(.caption.monospacedDigit())
+              .foregroundStyle(.secondary)
+          }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(6)
+      }
+    }
+  }
+
   /// What the last version change did, and what the app checked afterwards.
   ///
   /// Drawn whenever there is anything to say — including a report written by a *previous*
@@ -600,7 +640,10 @@ private struct RuntimePane: View {
               Text("active").font(.caption2).foregroundStyle(.secondary)
             }
           }
-          Divider()
+          // Between rows only. A trailing divider under the last release draws a line
+          // inside the box that reads as a stray rule (the screenshot this fixed), and
+          // with one release it is the only line in the card.
+          if release.id != model.releases.last?.id { Divider() }
         }
       }
       .frame(maxWidth: .infinity, alignment: .leading)

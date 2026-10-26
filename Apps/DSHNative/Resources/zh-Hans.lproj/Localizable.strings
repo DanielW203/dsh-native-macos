@@ -1,0 +1,6 @@
+/* The app's own interface strings are localized in code (AppPreferences.text) so the
+   menu bar can switch without relaunch. This file exists so the bundle advertises a
+   Simplified Chinese localization: with it, SwiftUI and AppKit draw their own standard
+   menus (编辑 / 显示 / 窗口 / 帮助, 关于, 隐藏, 退出) in Chinese as soon as the process
+   starts with AppleLanguages = zh-Hans. */
+"app.name" = "Native DSH";

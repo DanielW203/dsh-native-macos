@@ -32,7 +32,13 @@ public enum HarnessUpgradeChecks {
   /// A closure rather than a value because it is read once, after the handshake, and because a
   /// caller with no boot output at all — a check run against a harness the app did not start —
   /// must be able to say "no opinion" instead of "all fine".
-  public typealias BootHealthProvider = @Sendable () -> HarnessBootHealth?
+  ///
+  /// **Asynchronous on purpose.** The checks run on the upgrade coordinator's actor, so this
+  /// closure is read from a background executor; a window's answer, however, is `@MainActor`
+  /// state. An `async` provider is what lets that read be a hop (`await MainActor.run`) instead
+  /// of an assertion — the synchronous shape invited `MainActor.assumeIsolated`, which traps
+  /// (`dispatch_assert_queue_fail`) and took the app down inside every self-check.
+  public typealias BootHealthProvider = @Sendable () async -> HarnessBootHealth?
 
   public static func make(
     announcedURL: String,
@@ -500,7 +506,7 @@ private struct PluginCompatibilityCheck: HarnessCheck {
     // declared range is a claim, while "this entry did not activate" is an observation. The
     // 0.1.7 upgrade passed this check — the ranges it disagreed with were only a warning — and
     // left two plugins unloaded, which is exactly the gap this line closes.
-    let missing = context.bootHealth?()?.attributedPluginNames ?? []
+    let missing = await context.bootHealth?()?.attributedPluginNames ?? []
     do {
       let results = try store.compatibility(profile: context.profile, activeReleaseID: releaseID)
       let violations = results.filter {

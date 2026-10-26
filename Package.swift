@@ -50,6 +50,9 @@ let package = Package(
     .library(name: "HarnessIM", targets: ["HarnessIM"]),
     // The native mobile gateway: the `dsh-mobile-v1` WebSocket server a paired phone talks to.
     .library(name: "HarnessMobileGateway", targets: ["HarnessMobileGateway"]),
+    // The file-system half of what a harness loads as a skill: discovery, the invocation
+    // switches, create / import, and a recoverable delete.
+    .library(name: "HarnessSkills", targets: ["HarnessSkills"]),
     .executable(name: "harnessctl", targets: ["harnessctl"]),
   ],
   targets: [
@@ -97,7 +100,7 @@ let package = Package(
     // MARK: - Shared SwiftUI surface
     .target(
       name: "HarnessUI",
-      dependencies: ["HarnessKit", "HarnessRuntime", "HarnessIM"],
+      dependencies: ["HarnessKit", "HarnessRuntime", "HarnessIM", "HarnessMobileGateway", "HarnessSkills"],
       path: "Sources/HarnessUI",
       swiftSettings: commonSwiftSettings
     ),
@@ -141,6 +144,19 @@ let package = Package(
       name: "HarnessMobileGateway",
       dependencies: ["HarnessKit", "HarnessIM"],
       path: "Sources/HarnessMobileGateway",
+      swiftSettings: commonSwiftSettings
+    ),
+
+    // MARK: - Skills (file-system roots of the harness home and the workspace)
+    //
+    // A leaf module: it reads and writes SKILL.md files and needs no harness runtime, no
+    // workspace service and no UI framework. The window that presents it lives in HarnessUI
+    // and the menu item that opens it belongs to the app, so the file rules stay testable
+    // against a temporary directory.
+    .target(
+      name: "HarnessSkills",
+      dependencies: [],
+      path: "Sources/HarnessSkills",
       swiftSettings: commonSwiftSettings
     ),
 
@@ -194,6 +210,15 @@ let package = Package(
       name: "HarnessMobileGatewayTests",
       dependencies: ["HarnessMobileGateway"],
       path: "Tests/HarnessMobileGatewayTests",
+      swiftSettings: commonSwiftSettings
+    ),
+    // The skill rules — root precedence, frontmatter acceptance, the trash contract, the
+    // archive command line — are asserted against temporary directories and a stub command
+    // runner, so no test needs the user's real harness home.
+    .testTarget(
+      name: "HarnessSkillsTests",
+      dependencies: ["HarnessSkills"],
+      path: "Tests/HarnessSkillsTests",
       swiftSettings: commonSwiftSettings
     ),
     .testTarget(

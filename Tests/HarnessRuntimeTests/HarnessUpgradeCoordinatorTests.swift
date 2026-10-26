@@ -106,6 +106,31 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
     }
   }
 
+  /// A check that records which executor it ran on.
+  ///
+  /// The question is not what the check returns but where it returns from, and only the body
+  /// itself can answer it.
+  private final class ExecutorProbeCheck: HarnessCheck, @unchecked Sendable {
+    let name = "probe"
+    let isBlocking = false
+
+    private let lock = NSLock()
+    private var onMain = false
+
+    var ranOnMainActor: Bool {
+      lock.lock()
+      defer { lock.unlock() }
+      return onMain
+    }
+
+    func run() async -> HarnessCheckResult {
+      lock.lock()
+      onMain = Thread.isMainThread
+      lock.unlock()
+      return HarnessCheckResult(name: name, verdict: .pass, detail: "probe", isBlocking: isBlocking)
+    }
+  }
+
   private final class Bench {
     let paths: RuntimePaths
     let installer: HarnessInstaller
@@ -344,6 +369,24 @@ final class HarnessUpgradeCoordinatorTests: XCTestCase {
     let active = await bench.activeReleaseID()
     XCTAssertEqual(active, newID)
     XCTAssertNil(bench.pending.record)
+  }
+
+  /// The executor contract the app's window provider depends on.
+  ///
+  /// A check body runs on this actor's executor, never on the main actor — that is what makes
+  /// reading a `@MainActor` window's state inside a check a hop rather than an assertion. The
+  /// 0.2.0-rc.2 upgrade died because the window's boot-health provider asserted the opposite
+  /// (`MainActor.assumeIsolated`), which is only safe if this test is wrong. Pinned here so the
+  /// assumption is a test instead of a comment.
+  func testCheckBodiesRunOffTheMainActor() async throws {
+    let bench = try makeBench(self, active: newID, materialized: [oldID, newID])
+    let probe = ExecutorProbeCheck()
+
+    let report = await bench.coordinator(checks: [probe]).update(toReleaseID: newID)
+
+    XCTAssertEqual(report.outcome, .kept)
+    XCTAssertEqual(report.checks.map(\.name), ["boot", "probe"])
+    XCTAssertFalse(probe.ranOnMainActor, "check 现在跑在主 actor 上了：窗口侧跨 actor 读状态的前提已变")
   }
 
   // MARK: - Already there

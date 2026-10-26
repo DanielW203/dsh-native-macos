@@ -22,6 +22,10 @@ public enum HarnessWindowID {
   /// The skin manager. A window rather than a page of the Web UI because the Web UI is what
   /// a skin changes: a skin that renders badly must not take its own way out down with it.
   public static let skinManager = "harness.skinManager"
+  /// The skill centre. A native window for the same class of reason: it manages files in the
+  /// harness home and the workspace, and "the page is broken" is one of the states a user needs
+  /// a way out of.
+  public static let skillCenter = "harness.skillCenter"
   public static let wechat = "harness.wechat"
   /// The native mobile gateway: pairing QR, trusted devices, and the run mode. App-level
   /// rather than a page of the harness Web UI, because the gateway serves phones while no
@@ -30,4 +34,8 @@ public enum HarnessWindowID {
   public static let approvals = "harness.approvals"
   public static let backup = "harness.backup"
   public static let recovery = "harness.recovery"
+  /// Appearance and language. A normal window rather than SwiftUI's `Settings` scene: the
+  /// scene injects its own "Settings…" item that cannot be relabelled with the in-app
+  /// language and showed up beside ours as a duplicate.
+  public static let settings = "harness.settings"
 }
