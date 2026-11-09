@@ -595,6 +595,24 @@ public final class HarnessConsoleModel: ObservableObject {
     }
   }
 
+  /// Activate a release and immediately make the running server use it.
+  ///
+  /// A symlink swap on its own is invisible until something restarts the harness, so
+  /// "Activate" used to leave the user on the old runtime while the row said active. The
+  /// coordinator already knows how to activate, restart, verify, and roll back; this is the
+  /// same operation the update path runs, in the other direction.
+  public func activateAndRestart(_ id: String) async {
+    guard id != activeReleaseID else { return }
+    guard canUpdate else {
+      // No upgrade path was wired (an embedded host). The old behaviour is still better
+      // than a button that does nothing, and the help text says a restart is needed.
+      await activate(id)
+      append(.warning, "这个宿主没有接入自动重启，请手动重启 Harness 使 \(id) 生效。")
+      return
+    }
+    await update(toReleaseID: id)
+  }
+
   public func remove(_ id: String) async {
     guard let installer else { return }
     await run("Removing \(id)") {

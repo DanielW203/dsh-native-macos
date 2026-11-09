@@ -233,6 +233,17 @@ public actor HarnessAPIClient {
     }
   }
 
+  /// Use a cookie another component already authenticated with.
+  ///
+  /// The launch token is single-use, so a second consumer cannot mint its own session: it
+  /// has to join the one the page already owns. The cookie is exactly that credential —
+  /// `name=value`, unmodified.
+  public func adopt(sessionCookie: String) {
+    let trimmed = sessionCookie.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    cookie = trimmed
+  }
+
   /// Whether the handshake has happened (or been carried by the transport's cookie store).
   public var hasAuthenticated: Bool { cookie != nil }
 

@@ -523,8 +523,14 @@ public final class ApprovalAlertModel: ObservableObject {
 
   // MARK: Manual controls
 
-  /// Ask the system for permission now, from the window's button.
+  /// Ask the system for permission now, from the window's button or at launch.
+  ///
+  /// Turn-completion banners already post without this, but macOS silently drops them
+  /// until the process has been authorized. The only previous request path was "an
+  /// approval arrived", so a user who never saw an approval never got a completion
+  /// notification — the feature looked broken even though the watcher was running.
   public func requestNotificationAuthorization() async {
+    guard notificationsEnabled else { return }
     authorization = await presenter.ensureAuthorization()
     if authorization == .denied {
       notice = "系统通知被拒绝，可在「系统设置 → 通知 → DSH Native」里打开。"

@@ -93,6 +93,56 @@ BUILT_APP="$XCODE_DERIVED/Build/Products/Release/$APP_NAME"
 # picked up without reaching into DerivedData.
 RELEASE_APP="$ASCII_TMP/$APP_NAME"
 
+# Sign with a stable identity instead of always ad-hoc.
+#
+# This is not cosmetic. macOS keys TCC grants (Screen Recording, Accessibility) to the
+# code requirement in the signature. An ad-hoc requirement is the CDHash, so **every
+# rebuild produces a different app identity**: the switch in System Settings still looks
+# on for the previous build, while the new build asks for screen recording again. Using
+# a real Apple Development certificate makes the requirement `identifier + certificate`,
+# which survives rebuilds — grant once, and UI verification keeps working.
+#
+# Nothing personal is baked into the generated project: the bundle Xcode produced is
+# re-signed afterwards, and a machine without a certificate still builds ad-hoc with the
+# old behaviour.
+SIGNING_IDENTITY=""
+if [[ -n "${DSH_CODESIGN_IDENTITY:-}" ]]; then
+  SIGNING_IDENTITY="$DSH_CODESIGN_IDENTITY"
+else
+  SIGNING_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null \
+    | sed -n -e 's/.*"\(Apple Development:[^"]*\)".*/\1/p' \
+             -e 's/.*"\(Developer ID Application:[^"]*\)".*/\1/p' \
+    | head -1 || true)"
+fi
+if [[ -n "$SIGNING_IDENTITY" ]]; then
+  echo "signing identity: $SIGNING_IDENTITY"
+else
+  echo "warning: no Apple Development identity found; building ad-hoc." >&2
+  echo "         Screen Recording permission will reset after every rebuild." >&2
+fi
+
+# Re-sign the finished bundle with that identity.
+#
+# Xcode's own signing wants a team/provisioning account it does not have in this
+# checkout, so the app is built the way it always was and then re-signed with
+# `codesign` — the same direct path the PhoneHarness bundle uses. `--deep` covers the
+# embedded frameworks; the app's designated requirement becomes identifier + certificate,
+# which is what makes TCC grants survive the next build.
+stabilize_signature() {
+  local app="$1"
+  if [[ -z "$SIGNING_IDENTITY" ]]; then
+    return 0
+  fi
+  if ! codesign --force --deep --sign "$SIGNING_IDENTITY" "$app"; then
+    echo "error: re-signing $app with $SIGNING_IDENTITY failed" >&2
+    return 1
+  fi
+  if ! codesign --verify --deep --strict "$app"; then
+    echo "error: $app does not verify after re-signing" >&2
+    return 1
+  fi
+}
+
 # Regenerating the project is a prerequisite of every xcodebuild run, not a suggestion:
 # the project file lists every source explicitly, so adding a file without regenerating
 # produces "cannot find type X in scope" from Xcode while SwiftPM — which discovers
@@ -113,11 +163,6 @@ build_release_app() {
   # xcodebuild aborts before it builds anything. The architecture is pinned by the
   # project's `ARCHS` setting instead (see CONTRACT.md §5).
   #
-  # Signing is left to xcodebuild (the project signs ad-hoc with `CODE_SIGN_IDENTITY=-`).
-  # Passing `CODE_SIGNING_ALLOWED=NO` on an app that has bundle resources produces a
-  # bundle whose executable carries only a linker signature: `codesign --verify` then
-  # fails with "code has no resources but signature indicates they must be present" and
-  # no `_CodeSignature/CodeResources` is written, so the seal does not cover the icon.
   xcodebuild \
     -project "$ROOT/NativeHarness.xcodeproj" \
     -scheme DSHNative \
@@ -132,6 +177,10 @@ build_release_app() {
     echo "        arm64-only, so the build must stay pinned to $(uname -m).)" >&2
     exit 1
   fi
+
+  # Xcode signs ad-hoc; replace that with the stable identity before the bundle leaves
+  # the build tree. Skipped when no certificate is available.
+  stabilize_signature "$BUILT_APP" || return $?
 
   if ! codesign --verify --deep --strict "$BUILT_APP" 2>/dev/null; then
     echo "error: $BUILT_APP does not pass codesign verification; refusing to install it." >&2
@@ -213,6 +262,12 @@ verify_installed_app() {
     fails=$((fails + 1))
   fi
 
+  if codesign -dvvv "$app" 2>&1 | grep -q '^Signature=adhoc'; then
+    echo "  [warn] ad-hoc signature — Screen Recording permission resets on every rebuild"
+  else
+    echo "  [ok]   stable signing identity (TCC grants survive rebuilds)"
+  fi
+
   local icon_key=""
   icon_key="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist" 2>/dev/null || true)"
   [[ -z "$icon_key" ]] && icon_key="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$app/Contents/Info.plist" 2>/dev/null || true)"
@@ -281,14 +336,27 @@ case "${1:-build}" in
     SCHEME="${1:-DSHNative}"
     regenerate_project
     shift || true
-    exec xcodebuild \
+    xcodebuild \
       -project "$ROOT/NativeHarness.xcodeproj" \
       -scheme "$SCHEME" \
       -configuration Debug \
       -derivedDataPath "$XCODE_DERIVED" \
       -destination 'platform=macOS' \
       CODE_SIGNING_ALLOWED=NO \
-      build "$@"
+      build "$@" || exit $?
+    # Same stable identity for the Debug app used to verify UI locally. Other schemes do
+    # not necessarily produce DSHNative.app, so only sign the product when it exists.
+    DEBUG_APP="$XCODE_DERIVED/Build/Products/Debug/$APP_NAME"
+    if [[ -d "$DEBUG_APP" ]]; then
+      stabilize_signature "$DEBUG_APP" || exit $?
+    fi
+    ;;
+  reset-tcc)
+    # The recovery path for a stale grant: after this, the next launch asks once more.
+    /usr/bin/tccutil reset ScreenCapture ai.deepseek.nativeharness.DSHNative || exit $?
+    /usr/bin/tccutil reset Accessibility ai.deepseek.nativeharness.DSHNative || true
+    echo "reset Screen Recording / Accessibility grants for ai.deepseek.nativeharness.DSHNative"
+    echo "relaunch the app and grant once; stable signing keeps that grant across rebuilds."
     ;;
   release)
     shift || true

@@ -175,7 +175,7 @@ public final class HarnessWebModel: NSObject, ObservableObject {  @Published pub
   /// A cookie is named `dsh-auth-` plus the base64url SHA-256 of the *authority* it was
   /// issued for, so every `host:port` gets a cookie of its own that never overwrites
   /// another one: `dsh-auth-<hash(host:port)>`.
-  private static let authCookiePrefix = "dsh-auth-"
+  static let authCookiePrefix = "dsh-auth-"
 
   /// Message-handler name the injected relay script posts to.
   private static let consoleRelayName = "dshPageLog"
@@ -222,7 +222,7 @@ public final class HarnessWebModel: NSObject, ObservableObject {  @Published pub
   /// Recomputing the server's name is what makes "keep the live session, drop the rest"
   /// possible at all: HTTP cookies carry no port, so the authority is only ever visible in
   /// the name.
-  private static func authCookieName(for url: URL) -> String? {
+  static func authCookieName(for url: URL) -> String? {
     guard let host = url.host, let port = url.port else { return nil }
     let digest = SHA256.hash(data: Data("\(host):\(port)".utf8))
     let encoded = Data(digest).base64EncodedString()
@@ -480,6 +480,28 @@ extension HarnessWebModel: WKNavigationDelegate {
     failure = error.localizedDescription
     resetReadiness()
     onEvent("load failed before navigation: \(error.localizedDescription)")
+  }
+}
+
+/// Reads the harness cookie the page already authenticated with.
+///
+/// The launch token is single-use: the page spends it on its first document request and
+/// every later native consumer that tries to exchange the same token gets `401`. Any
+/// component that needs the harness API after the page is up — the quit guard is one —
+/// therefore has to borrow the cookie from the web view's jar instead of authenticating
+/// again. Reading it here, right before the call, also means a harness restart (new port,
+/// new authority, new cookie name) needs no bookkeeping on the native side.
+@MainActor
+public enum HarnessWebSessionCookie {
+  /// The cookie for `url`'s authority as a `name=value` header pair, or `nil` when the
+  /// page has not authenticated yet.
+  public static func value(for url: URL) async -> String? {
+    guard let name = HarnessWebModel.authCookieName(for: url) else { return nil }
+    let cookies = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
+    guard let cookie = cookies.first(where: { $0.name == name }), !cookie.value.isEmpty else {
+      return nil
+    }
+    return "\(cookie.name)=\(cookie.value)"
   }
 }
 

@@ -292,12 +292,15 @@ Facts that constrain this path, and that must not be re-derived:
   key reaches the plist, and Finder/Launchpad still draw the blank default icon
   (measured). The catalog is also the source of `CFBundleIconName` + `CFBundleIconFile`.
   Icon PNGs were extracted from the shipped `DSH Desktop.app` icon with `iconutil`.
-- **The app bundle must be signed as a whole.** `Tools/build.sh release` deliberately does
-  *not* pass `CODE_SIGNING_ALLOWED=NO` (the Debug path still does): on a bundle with
-  resources that flag leaves only a linker signature on the executable, no
-  `_CodeSignature/CodeResources`, and `codesign --verify` fails with "code has no
-  resources but signature indicates they must be present". The project's
-  `CODE_SIGN_IDENTITY=-` ad-hoc identity needs no certificate.
+- **The app bundle must be signed as a whole, with a stable identity when possible.**
+  Xcode still assembles the bundle the same way (the Debug path passes
+  `CODE_SIGNING_ALLOWED=NO`), and `Tools/build.sh` then re-signs it via
+  `stabilize_signature` with the machine's first Apple Development certificate. Without
+  a certificate it stays ad-hoc.
+  This is a permission requirement, not just distribution polish: an ad-hoc designated
+  requirement is the CDHash, so every rebuild looks like a different app to TCC and the
+  Screen Recording grant in System Settings no longer applies. A certificate-backed
+  requirement is `identifier + certificate` and survives rebuilds.
 - `Tools/build.sh release` refuses to report success unless the bundle has an executable
   **and** passes `codesign --verify --deep --strict`, so a broken build cannot be
   installed as a silently dead app.

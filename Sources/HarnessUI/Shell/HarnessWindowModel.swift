@@ -1154,6 +1154,31 @@ public final class HarnessWindowDelegate: NSObject, NSApplicationDelegate {
     guard let button = window.standardWindowButton(.closeButton) else { return }
     button.target = self
     button.action = #selector(closeButtonPressed(_:))
+    // The red button is only one way to close a window. File ▸ Close and ⌘W go through
+    // `performClose:` and never touch that button's action, so retargeting the button alone
+    // left the exact accident this guard exists to prevent unguarded. Retarget the menu item
+    // too; it is re-applied on every SwiftUI update in case the menu is rebuilt.
+    installCloseMenuItemGuard()
+  }
+
+  /// Point the standard Close menu item at this delegate.
+  ///
+  /// Finding it by selector rather than title keeps this working in every language the app
+  /// ships. Window-only commands in other windows still close those windows directly: the
+  /// handler below only takes over when the key window is the guarded main window.
+  private func installCloseMenuItemGuard() {
+    guard let mainMenu = NSApp.mainMenu else { return }
+    let closeSelectors: Set<Selector> = [
+      #selector(NSWindow.performClose(_:)),
+      #selector(NSWindow.close),
+    ]
+    for top in mainMenu.items {
+      guard let submenu = top.submenu else { continue }
+      for item in submenu.items where item.action.map(closeSelectors.contains) == true {
+        item.target = self
+        item.action = #selector(closeMenuItemPressed(_:))
+      }
+    }
   }
 
   /// Say that the app is quitting on purpose, so a restart/rebuild is not stopped by the
@@ -1170,7 +1195,18 @@ public final class HarnessWindowDelegate: NSObject, NSApplicationDelegate {
   @objc private func closeButtonPressed(_ sender: NSButton) {
     // The button's own window, not the remembered one: two main-group windows share this
     // target, and closing the front one must close the front one.
-    guard let window = sender.window ?? guardedWindow, !isStopping, !isConfirmingQuit else { return }
+    guard let window = sender.window ?? guardedWindow else { return }
+    requestClose(window)
+  }
+
+  /// File ▸ Close and ⌘W arrive here instead of going straight to `performClose:`.
+  @objc private func closeMenuItemPressed(_ sender: Any?) {
+    guard let window = NSApp.keyWindow ?? guardedWindow else { return }
+    requestClose(window)
+  }
+
+  private func requestClose(_ window: NSWindow) {
+    guard !isStopping, !isConfirmingQuit else { return }
     // Closing one of several windows does not quit the app, so it interrupts nothing and
     // must not interrupt the user with a dialog.
     guard isLastMainWindow(window), !terminationConfirmed, let model, model.isRunning else {
@@ -1234,7 +1270,14 @@ public final class HarnessWindowDelegate: NSObject, NSApplicationDelegate {
   /// answer ("Quit Anyway" / "Cancel", Escape = Cancel) is the right one.
   private func confirmQuitWithRunningSessions(_ model: HarnessWindowModel) async -> Bool {
     guard model.isRunning, let raw = model.url, let url = URL(string: raw) else { return true }
-    guard let count = await RunningSessionProbe.liveSessionCount(authenticatedURL: url) else {
+    // The page has already exchanged the single-use launch token for a cookie. Reusing that
+    // cookie is the only way this probe can still answer after the page has loaded; asking
+    // the token again would return `nil` every time, and `nil` means "no sessions" below.
+    let sessionCookie = await HarnessWebSessionCookie.value(for: url)
+    guard let count = await RunningSessionProbe.liveSessionCount(
+      authenticatedURL: url,
+      sessionCookie: sessionCookie
+    ) else {
       // The server is up but would not answer. Treating that as "nothing running" keeps the
       // app quittable; the alternative is a dialog the user cannot act on.
       model.recordBootNote("退出前无法查询运行中的会话，按没有会话处理。")

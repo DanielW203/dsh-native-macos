@@ -185,7 +185,7 @@ let package = Package(
     ),
     .testTarget(
       name: "HarnessUITests",
-      dependencies: ["HarnessUI", "HarnessRuntime"],
+      dependencies: ["HarnessUI", "HarnessRuntime", "HarnessIM"],
       path: "Tests/HarnessUITests",
       swiftSettings: commonSwiftSettings
     ),

@@ -1,5 +1,6 @@
 import Foundation
 import HarnessIM
+import HarnessKit
 
 /// Answers one question the window model cannot: is a turn still running on the harness?
 ///
@@ -19,6 +20,11 @@ public enum RunningSessionProbe {
   /// counting both would report one piece of work as two.
   public static func liveSessionCount(
     authenticatedURL: URL,
+    // The page's cookie, when there is one. Preferring it is not an optimization: the launch
+    // token is single-use, so re-authenticating here after the page has spent it always
+    // fails, and the old code then reported "could not tell" — which the quit guard turns
+    // into "nothing is running". That is the bug this parameter exists to close.
+    sessionCookie: String? = nil,
     // Short on purpose: this runs while the user is trying to quit, so an unresponsive
     // harness must not hold the app open for the transport's usual 30 seconds.
     transport: HarnessAPITransport = URLSessionHarnessTransport(timeout: 3)
@@ -27,8 +33,21 @@ public enum RunningSessionProbe {
       let parsed = try HarnessAPIClient.parse(authenticatedURL: authenticatedURL)
       let client = HarnessAPIClient(baseURL: parsed.origin, transport: transport)
       defer { client.invalidate() }
-      try await client.authenticate(token: parsed.token)
-      let sessions = try await client.listSessions()
+      let sessions: [SessionSummary]
+      if let sessionCookie, !sessionCookie.isEmpty {
+        await client.adopt(sessionCookie: sessionCookie)
+        do {
+          sessions = try await client.listSessions()
+        } catch {
+          // A cookie for a dead port is possible across a restart. One token handshake is
+          // still worth trying; if that also fails the caller is told "could not tell".
+          try await client.authenticate(token: parsed.token)
+          sessions = try await client.listSessions()
+        }
+      } else {
+        try await client.authenticate(token: parsed.token)
+        sessions = try await client.listSessions()
+      }
       return sessions.filter { $0.isLive && !$0.isSubagent }.count
     } catch {
       return nil

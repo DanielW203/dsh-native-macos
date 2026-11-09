@@ -424,17 +424,22 @@ private struct RuntimePane: View {
               }
               Spacer()
               if model.canUpdate {
+                // One action per candidate. The old pair — "下载并更新" next to a bare
+                // "Install" — asked the user to choose between two buttons that both
+                // installed the same version, with the only real difference (restart and
+                // self-check) buried in the help text.
                 Button("下载并更新") {
                   Task { await model.downloadAndUpdate(candidate) }
                 }
                 .disabled(model.isBusy || model.upgradeRunning)
                 .help("下载后自动激活、重启并自检；起不来就自动回到当前版本")
+              } else {
+                Button("Install") {
+                  Task { await model.install(source: candidate.source) }
+                }
+                .disabled(model.isBusy)
+                .help("只安装并激活，不重启、不检查")
               }
-              Button("Install") {
-                Task { await model.install(source: candidate.source) }
-              }
-              .disabled(model.isBusy)
-              .help("只安装并激活，不重启、不检查")
             }
           }
           ForEach(model.channelNotes, id: \.self) { note in
@@ -620,15 +625,19 @@ private struct RuntimePane: View {
             }
             if release.id != model.activeReleaseID {
               if model.canUpdate {
-                Button("更新并重启") {
-                  Task { await model.update(toReleaseID: release.id) }
+                // One button, and it does the whole job. A separate "Activate" implied the
+                // click was done once the symlink moved, while the running server kept
+                // serving the old version until a manual restart.
+                Button("激活并重启") {
+                  Task { await model.activateAndRestart(release.id) }
                 }
                 .disabled(model.isBusy || model.upgradeRunning)
-                .help("激活这个版本、重启 harness 并自检；起不来就自动回到当前版本")
+                .help("激活这个版本、自动重启 harness 并自检；起不来就自动回到当前版本")
+              } else {
+                Button("Activate") { Task { await model.activate(release.id) } }
+                  .disabled(model.isBusy)
+                  .help("只切换版本；这个宿主没有接入自动重启")
               }
-              Button("Activate") { Task { await model.activate(release.id) } }
-                .disabled(model.isBusy)
-                .help("只切换版本，不重启、不检查")
               Button("Remove") { Task { await model.remove(release.id) } }
                 .disabled(!model.canRemove(release))
                 .help(

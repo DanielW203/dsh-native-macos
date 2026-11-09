@@ -248,7 +248,13 @@ struct DSHNativeApp: App {
           // credentials, and "start clean" has to mean that too.
           if DSHNativeApp.harnessURL.value != nil, !safeBoot.isSafe { wechat.harnessBecameAvailable() }
           mobileGateway.harnessBecameAvailable()
-          Task { await alerts.refreshConnection() }
+          Task {
+            await alerts.refreshConnection()
+            // Ask once, at a moment the user is looking at the app. Completion banners
+            // cannot appear before this process has notification permission, and the
+            // old flow only asked after an approval happened to arrive.
+            await alerts.requestNotificationAuthorization()
+          }
         }
         // The channel reads this on every submission, so it must follow start/stop.
         .onChange(of: model.url) { _, newValue in

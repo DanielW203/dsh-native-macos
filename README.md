@@ -191,7 +191,9 @@ sw_vers && uname -m && xcodebuild -version && node --version
 
 > 目前**尚未提供预构建安装包**：需要本机构建，Apple Silicon + Xcode 16 起步。
 
-**没有 Apple 开发者账号也能装**：本机用 ad-hoc 签名构建，不需要证书或公证，Gatekeeper 不会拦。
+**没有 Apple 开发者账号也能装**：构建脚本会优先用本机第一个 Apple Development 证书签名，找不到证书时退回 ad-hoc，不需要公证，Gatekeeper 不会拦。
+
+> 用真实证书签名不只是为了分发。macOS 的屏幕录制 / 辅助功能授权认的是代码签名里的 designated requirement；ad-hoc 的要求基于 CDHash，**每次重建都等于换了一个 App**：系统设置里的开关看着还开着，新构建却拿不到权限、又弹一次授权。Tools/build.sh 因此会在 Xcode 构建完成后用同一个证书重签整个 bundle，授权只需给一次。
 
 ```bash
 cd /path/to/dsh-native-macos
@@ -202,6 +204,9 @@ Tools/build.sh verify                 # ③ 逐项验证：包完整性、可执
 
 也可以一步到位：`Tools/build.sh install`（可选 `--wait` 等索引、`--system` 装全局、`--dock` 钉到程序坞、
 `--quit` 先退出正在运行的 App）。改了代码重跑一次即可，启动台里还是同一个图标。
+
+如果屏幕录制仍然卡在旧的 ad-hoc 授权记录上（设置里开着、新构建却拿不到），运行
+`Tools/build.sh reset-tcc` 清掉该 App 的屏幕录制 / 辅助功能授权，再启动 App 授权一次。
 
 **为什么不能在 Xcode 里 ▶ Run**：Xcode 只把产物写进 `DerivedData`，而启动台只索引 `/Applications`
 与 `~/Applications`；而且 Debug 产物开了 `ENABLE_DEBUG_DYLIB`，拷出来双击也跑不起来。所以必须

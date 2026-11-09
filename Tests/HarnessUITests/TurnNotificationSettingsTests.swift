@@ -70,6 +70,30 @@ final class TurnNotificationSettingsTests: XCTestCase {
     XCTAssertTrue(second.subagentNotificationsEnabled)
   }
 
+  // MARK: - Permission
+
+  /// The app asks at launch so a completion banner can actually appear. That request must
+  /// respect the master switch: turning notifications off has to mean no prompt either.
+  func testLaunchPermissionRequestRespectsTheMasterSwitch() async {
+    let presenter = RecordingApprovalPresenter(authorization: .notDetermined)
+    let model = ApprovalAlertModel(
+      urlProvider: { nil },
+      defaults: defaults,
+      presenter: presenter
+    )
+
+    model.notificationsEnabled = false
+    await model.requestNotificationAuthorization()
+    XCTAssertEqual(model.authorization, .notDetermined)
+    XCTAssertEqual(presenter.authorization, .notDetermined)
+
+    model.notificationsEnabled = true
+    presenter.stubbedAuthorization = .authorized
+    await model.requestNotificationAuthorization()
+    XCTAssertEqual(model.authorization, .authorized)
+    XCTAssertEqual(presenter.authorization, .authorized)
+  }
+
   // MARK: - Which endings are announced
 
   func testCompletedAndFailedTurnsAreAnnounced() async {
